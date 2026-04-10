@@ -30,6 +30,7 @@ class RuntimeConfig:
     batch_size: int
     max_assets_per_moment: int
     crop_padding: float
+    ffmpeg_bin: str
 
 
 def runtime_manifest_path(output_dir: Path) -> Path:
@@ -111,6 +112,7 @@ def rebuild_runtime_bundle(config: RuntimeConfig) -> dict:
             max_assets_per_moment=config.max_assets_per_moment,
             crop_padding=config.crop_padding,
             overwrite=False,
+            ffmpeg_bin=config.ffmpeg_bin,
         )
 
     bundle_file = build_search_bundle(

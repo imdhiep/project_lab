@@ -26,6 +26,7 @@ class Moment:
     video_path: str
     label_path: str
     track_id: str
+    fps: float
     start_frame: int
     end_frame: int
     start_second: float
@@ -44,6 +45,7 @@ class Moment:
     @classmethod
     def from_dict(cls, payload: dict) -> "Moment":
         payload = dict(payload)
+        payload.setdefault("fps", 30.0)
         payload.setdefault("keywords", [])
         payload.setdefault("frame_paths", [])
         payload.setdefault("crop_paths", [])

@@ -170,6 +170,7 @@ def build_moments_from_label(
                 video_path=payload["video_path"],
                 label_path=payload["label_path"],
                 track_id=payload["track_id"],
+                fps=float(fps),
                 start_frame=payload["start_frame"],
                 end_frame=payload["end_frame"],
                 start_second=round(start_second, 3),

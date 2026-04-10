@@ -25,7 +25,12 @@ from .config import (
 from .dataset import collect_moments, download_from_huggingface
 from .indexer import build_search_bundle, search_index
 from .runtime import RuntimeConfig, rebuild_runtime_bundle, watch_and_rebuild
-from .video_tools import extract_clip, extract_visual_assets
+from .video_tools import (
+    attach_existing_visual_assets,
+    count_visual_assets,
+    extract_clip,
+    extract_visual_assets,
+)
 
 
 def parse_csv(value: str | None, fallback: tuple[str, ...] | None = None) -> list[str] | None:
@@ -109,6 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--max-assets-per-moment", type=int, default=DEFAULT_MAX_ASSETS_PER_MOMENT)
     prepare_parser.add_argument("--crop-padding", type=float, default=0.08)
     prepare_parser.add_argument("--overwrite", action="store_true")
+    prepare_parser.add_argument("--ffmpeg-bin", default="ffmpeg")
 
     build_parser_cmd = subparsers.add_parser("build", help="Build a full multimodal search bundle")
     build_parser_cmd.add_argument("--dataset-root", default=str(default_data_root()))
@@ -127,6 +133,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_parser_cmd.add_argument("--clip-pretrained", default=DEFAULT_CLIP_PRETRAINED)
     build_parser_cmd.add_argument("--device", default=None)
     build_parser_cmd.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    build_parser_cmd.add_argument("--ffmpeg-bin", default="ffmpeg")
     build_parser_cmd.add_argument("--no-sparse", action="store_true")
     build_parser_cmd.add_argument("--no-dense", action="store_true")
     build_parser_cmd.add_argument("--no-clip", action="store_true")
@@ -136,6 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--query-text", default=None)
     search_parser.add_argument("--image-path", default=None)
     search_parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
+    search_parser.add_argument("--search-mode", choices=("default", "person"), default="default")
     search_parser.add_argument("--weights", default=None, help="Example: sparse=0.1,dense=0.4,clip_text=0.2,clip_image=0.3")
     search_parser.add_argument("--json", action="store_true")
 
@@ -143,6 +151,7 @@ def build_parser() -> argparse.ArgumentParser:
     clip_parser.add_argument("--output-dir", default=str(default_bundle_root()))
     clip_parser.add_argument("--query-text", default=None)
     clip_parser.add_argument("--image-path", default=None)
+    clip_parser.add_argument("--search-mode", choices=("default", "person"), default="default")
     clip_parser.add_argument("--weights", default=None)
     clip_parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     clip_parser.add_argument("--rank", type=int, default=1, help="1-based result rank")
@@ -173,6 +182,7 @@ def build_parser() -> argparse.ArgumentParser:
     rebuild_parser.add_argument("--clip-pretrained", default=DEFAULT_CLIP_PRETRAINED)
     rebuild_parser.add_argument("--device", default=None)
     rebuild_parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    rebuild_parser.add_argument("--ffmpeg-bin", default="ffmpeg")
     rebuild_parser.add_argument("--no-sparse", action="store_true")
     rebuild_parser.add_argument("--no-dense", action="store_true")
     rebuild_parser.add_argument("--no-clip", action="store_true")
@@ -193,6 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser.add_argument("--clip-pretrained", default=DEFAULT_CLIP_PRETRAINED)
     watch_parser.add_argument("--device", default=None)
     watch_parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    watch_parser.add_argument("--ffmpeg-bin", default="ffmpeg")
     watch_parser.add_argument("--poll-seconds", type=float, default=10.0)
     watch_parser.add_argument("--once", action="store_true")
     watch_parser.add_argument("--no-sparse", action="store_true")
@@ -235,6 +246,7 @@ def _runtime_config_from_args(args: argparse.Namespace) -> RuntimeConfig:
         batch_size=args.batch_size,
         max_assets_per_moment=args.max_assets_per_moment,
         crop_padding=args.crop_padding,
+        ffmpeg_bin=args.ffmpeg_bin,
     )
 
 
@@ -281,23 +293,43 @@ def command_prepare_assets(args: argparse.Namespace) -> None:
         max_assets_per_moment=args.max_assets_per_moment,
         crop_padding=args.crop_padding,
         overwrite=args.overwrite,
+        ffmpeg_bin=args.ffmpeg_bin,
     )
-    print(f"Prepared visual assets for {len(moments)} moments in {assets_dir}")
+    attach_existing_visual_assets(moments, assets_dir)
+    summary = count_visual_assets(moments)
+    if summary["moments_with_visuals"] == 0:
+        raise RuntimeError(
+            "No visual assets were created. Check that the .mp4 exists and ffmpeg/cv2 can decode it."
+        )
+    print(
+        f"Prepared visual assets for {summary['moments_with_visuals']} moments "
+        f"({summary['frame_count']} frames, {summary['crop_count']} crops) in {assets_dir}"
+    )
 
 
 def command_build(args: argparse.Namespace) -> None:
     enable_sparse, enable_dense, enable_clip = resolve_profile(args.profile, args)
     moments = _collect_moments_for_args(args)
+    assets_dir = Path(args.assets_dir)
 
     if enable_clip:
+        attach_existing_visual_assets(moments, assets_dir)
         videos_available = any(Path(moment.video_path).exists() for moment in moments)
-        if videos_available:
+        missing_visuals = not any(moment.frame_paths or moment.crop_paths for moment in moments)
+        if videos_available and (args.prepare_assets or missing_visuals):
             extract_visual_assets(
                 moments,
-                output_dir=Path(args.assets_dir),
+                output_dir=assets_dir,
                 max_assets_per_moment=args.max_assets_per_moment,
                 crop_padding=args.crop_padding,
                 overwrite=False,
+                ffmpeg_bin=args.ffmpeg_bin,
+            )
+            attach_existing_visual_assets(moments, assets_dir)
+        visual_summary = count_visual_assets(moments)
+        if visual_summary["moments_with_visuals"] == 0:
+            print(
+                "Warning: CLIP branch disabled because no visual assets were found after asset preparation."
             )
         elif args.prepare_assets:
             raise FileNotFoundError(
@@ -328,6 +360,7 @@ def command_search(args: argparse.Namespace) -> None:
         query_image_path=args.image_path,
         top_k=args.top_k,
         weights=parse_weights(args.weights),
+        search_mode=args.search_mode,
     )
 
     if args.json:
@@ -354,6 +387,7 @@ def command_clip(args: argparse.Namespace) -> None:
         query_image_path=args.image_path,
         top_k=max(args.rank, args.top_k),
         weights=parse_weights(args.weights),
+        search_mode=args.search_mode,
     )
     if len(results) < args.rank:
         raise ValueError("Requested rank exceeds number of search results.")

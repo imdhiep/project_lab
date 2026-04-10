@@ -20,6 +20,24 @@ DEFAULT_WEIGHTS = {
     "clip_text": 0.25,
     "clip_image": 0.25,
 }
+PERSON_TERMS = frozenset(
+    {
+        "person",
+        "persons",
+        "pedestrian",
+        "pedestrians",
+        "man",
+        "men",
+        "woman",
+        "women",
+        "people",
+        "human",
+        "humans",
+        "walker",
+        "walkers",
+    }
+)
+PERSON_QUERY_EXPANSION = "person pedestrian man woman people human walker"
 
 
 def _np():
@@ -73,6 +91,34 @@ def _write_faiss(embeddings, index_path: Path) -> str | None:
 
 def _artifact_enabled(bundle: dict, name: str) -> bool:
     return bool(bundle.get("artifacts", {}).get(name, {}).get("enabled"))
+
+
+def _tokenize_query(text: str) -> set[str]:
+    return {token.strip(" ,.!?;:()[]{}\"'").lower() for token in text.split() if token.strip()}
+
+
+def _expand_query_text(query_text: str, search_mode: str) -> str:
+    query_text = query_text.strip()
+    if search_mode != "person" or not query_text:
+        return query_text
+
+    tokens = _tokenize_query(query_text)
+    if tokens & PERSON_TERMS:
+        return f"{query_text}. pedestrian person human"
+    return f"{query_text}. {PERSON_QUERY_EXPANSION}"
+
+
+def _person_signal(moment: Moment) -> float:
+    terms = {token.lower() for token in moment.keywords}
+    for caption in moment.captions:
+        terms.update(_tokenize_query(caption))
+
+    matches = len(terms & PERSON_TERMS)
+    if matches == 0:
+        return 0.0
+    if matches == 1:
+        return 0.65
+    return 1.0
 
 
 def build_search_bundle(
@@ -305,6 +351,7 @@ def search_index(
     query_image_path: str | None = None,
     top_k: int = 5,
     weights: dict[str, float] | None = None,
+    search_mode: str = "default",
 ) -> list[dict]:
     if not query_text and not query_image_path:
         raise ValueError("Provide `query_text` and/or `query_image_path`.")
@@ -313,15 +360,16 @@ def search_index(
     bundle = load_bundle(output_dir)
     moments = _load_moments(Path(bundle["moments_path"]))
     score_vectors: dict[str, object] = {}
+    effective_query_text = _expand_query_text(query_text, search_mode) if query_text else None
 
-    if query_text and _artifact_enabled(bundle, "sparse"):
-        score_vectors["sparse"] = _search_sparse_scores(bundle, query_text)
+    if effective_query_text and _artifact_enabled(bundle, "sparse"):
+        score_vectors["sparse"] = _search_sparse_scores(bundle, effective_query_text)
 
-    if query_text and _artifact_enabled(bundle, "dense"):
-        score_vectors["dense"] = _search_dense_scores(bundle, query_text)
+    if effective_query_text and _artifact_enabled(bundle, "dense"):
+        score_vectors["dense"] = _search_dense_scores(bundle, effective_query_text)
 
-    if query_text and _artifact_enabled(bundle, "clip"):
-        score_vectors["clip_text"] = _search_clip_text_scores(bundle, query_text, len(moments))
+    if effective_query_text and _artifact_enabled(bundle, "clip"):
+        score_vectors["clip_text"] = _search_clip_text_scores(bundle, effective_query_text, len(moments))
 
     if query_image_path and _artifact_enabled(bundle, "clip"):
         score_vectors["clip_image"] = _search_clip_image_scores(bundle, query_image_path, len(moments))
@@ -330,6 +378,10 @@ def search_index(
         raise ValueError("No search branch is available for the provided query.")
 
     combined, normalized, resolved_weights = _fuse_score_vectors(score_vectors, weights)
+    person_scores = None
+    if search_mode == "person":
+        person_scores = np.array([_person_signal(moment) for moment in moments], dtype="float32")
+        combined = combined + (0.35 * person_scores)
     ranked_indices = np.argsort(-combined)[: min(top_k, len(moments))]
 
     results = []
@@ -343,6 +395,9 @@ def search_index(
                 score_breakdown=raw_breakdown,
                 normalized_breakdown=norm_breakdown,
                 weights=resolved_weights,
+                search_mode=search_mode,
+                expanded_query=effective_query_text if effective_query_text != query_text else None,
+                person_match=float(person_scores[index]) if person_scores is not None else None,
             )
         )
     return results
@@ -413,6 +468,9 @@ def _format_result(
     score_breakdown: dict[str, float],
     normalized_breakdown: dict[str, float],
     weights: dict[str, float],
+    search_mode: str,
+    expanded_query: str | None,
+    person_match: float | None,
 ) -> dict:
     payload = moment.to_dict()
     payload["score"] = round(score, 6)
@@ -422,4 +480,9 @@ def _format_result(
     }
     payload["weights"] = {key: round(value, 6) for key, value in weights.items()}
     payload["visual_path"] = select_visual_path(moment)
+    payload["search_mode"] = search_mode
+    if expanded_query:
+        payload["expanded_query"] = expanded_query
+    if person_match is not None:
+        payload["person_match"] = round(person_match, 6)
     return payload

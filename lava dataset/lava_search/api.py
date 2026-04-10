@@ -14,6 +14,7 @@ class SearchRequest(BaseModel):
     query_text: str | None = None
     image_path: str | None = None
     top_k: int = Field(default=5, ge=1, le=50)
+    search_mode: str = Field(default="default", pattern="^(default|person)$")
     weights: dict[str, float] | None = None
 
     @model_validator(mode="after")
@@ -63,6 +64,7 @@ def create_app(output_dir: str | Path) -> FastAPI:
                     query_image_path=payload.image_path,
                     top_k=payload.top_k,
                     weights=payload.weights,
+                    search_mode=payload.search_mode,
                 )
             }
         except Exception as exc:
@@ -77,6 +79,7 @@ def create_app(output_dir: str | Path) -> FastAPI:
                 query_image_path=payload.image_path,
                 top_k=max(payload.rank, payload.top_k),
                 weights=payload.weights,
+                search_mode=payload.search_mode,
             )
             if len(results) < payload.rank:
                 raise ValueError("Requested rank exceeds available results.")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
 from .models import Moment
@@ -19,6 +20,37 @@ def select_visual_path(moment: Moment) -> str | None:
     return None
 
 
+def attach_existing_visual_assets(moments: list[Moment], assets_dir: Path) -> list[Moment]:
+    assets_dir = Path(assets_dir)
+    if not assets_dir.exists():
+        return moments
+
+    for moment in moments:
+        moment_dir = assets_dir / sanitize_name(moment.id)
+        if not moment_dir.exists():
+            continue
+
+        frame_paths = sorted(str(path) for path in moment_dir.glob("frame_*.jpg"))
+        crop_paths = sorted(str(path) for path in moment_dir.glob("crop_*.jpg"))
+        if frame_paths:
+            moment.frame_paths = frame_paths
+        if crop_paths:
+            moment.crop_paths = crop_paths
+
+    return moments
+
+
+def count_visual_assets(moments: list[Moment]) -> dict[str, int]:
+    frame_count = sum(len(moment.frame_paths) for moment in moments)
+    crop_count = sum(len(moment.crop_paths) for moment in moments)
+    moments_with_visuals = sum(1 for moment in moments if moment.frame_paths or moment.crop_paths)
+    return {
+        "moments_with_visuals": moments_with_visuals,
+        "frame_count": frame_count,
+        "crop_count": crop_count,
+    }
+
+
 def _require_cv2():
     try:
         import cv2
@@ -27,6 +59,14 @@ def _require_cv2():
             "opencv-python-headless is required for frame extraction."
         ) from exc
     return cv2
+
+
+def _require_pil_image():
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError("Pillow is required for ffmpeg fallback image loading.") from exc
+    return Image
 
 
 def _clip_bbox(bbox: list[int], width: int, height: int, padding_ratio: float) -> list[int]:
@@ -43,14 +83,83 @@ def _clip_bbox(bbox: list[int], width: int, height: int, padding_ratio: float) -
     ]
 
 
+def _frame_time_for(moment: Moment, frame_idx: int) -> float:
+    fps = moment.fps if moment.fps > 0 else 30.0
+    return frame_idx / fps
+
+
+def _extract_frame_with_ffmpeg(video_path: Path, second: float, ffmpeg_bin: str) -> object | None:
+    Image = _require_pil_image()
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as handle:
+        temp_path = Path(handle.name)
+    try:
+        command = [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            f"{second:.3f}",
+            "-i",
+            str(video_path),
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            "-y",
+            str(temp_path),
+        ]
+        completed = subprocess.run(command, check=False)
+        if completed.returncode != 0 or not temp_path.exists() or temp_path.stat().st_size == 0:
+            return None
+        image = Image.open(temp_path).convert("RGB")
+        return image.copy()
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _write_frame(frame, frame_path: Path) -> None:
+    frame_path.parent.mkdir(parents=True, exist_ok=True)
+    if hasattr(frame, "save"):
+        frame.save(frame_path, format="JPEG")
+        return
+
+    cv2 = _require_cv2()
+    cv2.imwrite(str(frame_path), frame)
+
+
+def _frame_size(frame) -> tuple[int, int]:
+    if hasattr(frame, "size"):
+        width, height = frame.size
+        return int(width), int(height)
+    height, width = frame.shape[:2]
+    return int(width), int(height)
+
+
+def _crop_frame(frame, bbox: list[int]):
+    if hasattr(frame, "crop"):
+        return frame.crop((bbox[0], bbox[1], bbox[2], bbox[3]))
+    return frame[bbox[1] : bbox[3], bbox[0] : bbox[2]]
+
+
+def _crop_has_content(crop) -> bool:
+    if hasattr(crop, "size") and not isinstance(crop.size, int):
+        return crop.size[0] > 0 and crop.size[1] > 0
+    return bool(getattr(crop, "size", 0))
+
+
 def extract_visual_assets(
     moments: list[Moment],
     output_dir: Path,
     max_assets_per_moment: int = 3,
     crop_padding: float = 0.08,
     overwrite: bool = False,
+    ffmpeg_bin: str = "ffmpeg",
 ) -> list[Moment]:
-    cv2 = _require_cv2()
+    try:
+        cv2 = _require_cv2()
+    except RuntimeError:
+        cv2 = None
     output_dir.mkdir(parents=True, exist_ok=True)
 
     for moment in moments:
@@ -66,9 +175,12 @@ def extract_visual_assets(
         if not video_file.exists():
             continue
 
-        capture = cv2.VideoCapture(str(video_file))
-        if not capture.isOpened():
-            continue
+        capture = None
+        if cv2 is not None:
+            capture = cv2.VideoCapture(str(video_file))
+            if not capture.isOpened():
+                capture.release()
+                capture = None
 
         try:
             for moment in video_moments:
@@ -77,28 +189,39 @@ def extract_visual_assets(
                 moment_dir.mkdir(parents=True, exist_ok=True)
 
                 for frame_idx in chosen_frames:
-                    capture.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                    ok, frame = capture.read()
-                    if not ok:
+                    frame = None
+                    if capture is not None:
+                        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                        ok, frame = capture.read()
+                        if not ok:
+                            frame = None
+                    if frame is None:
+                        frame = _extract_frame_with_ffmpeg(
+                            video_file,
+                            second=_frame_time_for(moment, frame_idx),
+                            ffmpeg_bin=ffmpeg_bin,
+                        )
+                    if frame is None:
                         continue
 
                     frame_path = moment_dir / f"frame_{frame_idx:06d}.jpg"
                     if overwrite or not frame_path.exists():
-                        cv2.imwrite(str(frame_path), frame)
+                        _write_frame(frame, frame_path)
                     moment.frame_paths.append(str(frame_path))
 
                     bbox = moment.representative_bbox
                     if len(bbox) == 4 and bbox[2] > bbox[0] and bbox[3] > bbox[1]:
-                        height, width = frame.shape[:2]
+                        width, height = _frame_size(frame)
                         clip_box = _clip_bbox(bbox, width, height, crop_padding)
-                        crop = frame[clip_box[1] : clip_box[3], clip_box[0] : clip_box[2]]
-                        if crop.size:
+                        crop = _crop_frame(frame, clip_box)
+                        if _crop_has_content(crop):
                             crop_path = moment_dir / f"crop_{frame_idx:06d}.jpg"
                             if overwrite or not crop_path.exists():
-                                cv2.imwrite(str(crop_path), crop)
+                                _write_frame(crop, crop_path)
                             moment.crop_paths.append(str(crop_path))
         finally:
-            capture.release()
+            if capture is not None:
+                capture.release()
 
     return moments
 
