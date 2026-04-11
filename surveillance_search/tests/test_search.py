@@ -1,6 +1,7 @@
 import shutil
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from surveillance_search.indexer import build_search_bundle, search_index
 from surveillance_search.models import Moment
@@ -188,6 +189,153 @@ class SearchTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "does not contain person-labeled moments"):
             search_index(case_root, query_text="person near road", search_mode="person", top_k=1)
+
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+    def test_qwen_parser_can_normalize_vietnamese_person_query(self) -> None:
+        temp_root = Path(__file__).resolve().parents[1] / ".tmp-tests"
+        case_root = temp_root / "search-qwen-parser"
+        shutil.rmtree(case_root, ignore_errors=True)
+        case_root.mkdir(parents=True, exist_ok=True)
+
+        moments = [
+            Moment(
+                id="uid_vid_00007:train:track:1",
+                location="uid_vid_00007",
+                split="train",
+                video_path=str(case_root / "uid_vid_00007.mp4"),
+                label_path=str(case_root / "uid_vid_00007.mp4.json"),
+                track_id="1",
+                fps=24.0,
+                start_frame=0,
+                end_frame=20,
+                start_second=0.0,
+                end_second=0.8,
+                captions=["person"],
+                representative_bbox=[10, 20, 40, 80],
+                sample_frames=[0, 10, 20],
+                text="person pedestrian track in surveillance video uid_vid_00007. Evidence: red sweater. near road.",
+                keywords=["person", "pedestrian", "red", "sweater", "road"],
+                attribute_evidence={"top_color": "red", "top_type": "sweater"},
+                scene_evidence={"near_road": True},
+            )
+        ]
+
+        build_search_bundle(
+            moments=moments,
+            output_dir=case_root,
+            enable_sparse=True,
+            enable_dense=False,
+            enable_clip=False,
+        )
+
+        with mock.patch("surveillance_search.indexer.qwen_feature_available", return_value=True), mock.patch(
+            "surveillance_search.indexer.parse_person_query_with_qwen",
+            return_value={
+                "must_be_person": True,
+                "top_color": "red",
+                "top_type": "sweater",
+                "accessories": [],
+                "near_road": True,
+                "retrieval_terms": ["person", "red", "sweater", "near", "road"],
+                "normalized_query": "person red sweater near road",
+                "parser_source": "mock",
+            },
+        ):
+            results = search_index(
+                case_root,
+                query_text="người mặc áo đỏ gần đường",
+                search_mode="person",
+                top_k=1,
+                use_qwen_parser=True,
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["attribute_match"], 1.0)
+        self.assertEqual(results[0]["scene_match"], 1.0)
+        self.assertTrue(results[0]["qwen_parser_used"])
+        self.assertEqual(results[0]["structured_query"]["top_color"], "red")
+
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+    def test_qwen_reranker_can_reorder_top_candidates(self) -> None:
+        temp_root = Path(__file__).resolve().parents[1] / ".tmp-tests"
+        case_root = temp_root / "search-qwen-reranker"
+        shutil.rmtree(case_root, ignore_errors=True)
+        case_root.mkdir(parents=True, exist_ok=True)
+
+        moments = [
+            Moment(
+                id="uid_vid_00002:train:track:3",
+                location="uid_vid_00002",
+                split="train",
+                video_path=str(case_root / "uid_vid_00002.mp4"),
+                label_path=str(case_root / "uid_vid_00002.mp4.json"),
+                track_id="3",
+                fps=24.0,
+                start_frame=0,
+                end_frame=20,
+                start_second=0.0,
+                end_second=0.8,
+                captions=["person"],
+                representative_bbox=[10, 20, 40, 80],
+                sample_frames=[0, 10, 20],
+                text="person pedestrian track in surveillance video",
+                keywords=["person", "pedestrian", "surveillance"],
+                attribute_evidence={"top_color": "black", "top_type": "coat"},
+            ),
+            Moment(
+                id="uid_vid_00007:train:track:1",
+                location="uid_vid_00007",
+                split="train",
+                video_path=str(case_root / "uid_vid_00007.mp4"),
+                label_path=str(case_root / "uid_vid_00007.mp4.json"),
+                track_id="1",
+                fps=24.0,
+                start_frame=0,
+                end_frame=20,
+                start_second=0.0,
+                end_second=0.8,
+                captions=["person"],
+                representative_bbox=[10, 20, 40, 80],
+                sample_frames=[0, 10, 20],
+                text="person pedestrian track in surveillance video",
+                keywords=["person", "pedestrian", "surveillance"],
+                attribute_evidence={"top_color": "red", "top_type": "sweater"},
+                scene_evidence={"near_road": True},
+            ),
+        ]
+
+        build_search_bundle(
+            moments=moments,
+            output_dir=case_root,
+            enable_sparse=True,
+            enable_dense=False,
+            enable_clip=False,
+        )
+
+        def _mock_rerank(*, moments, **kwargs):
+            scores = []
+            for moment in moments:
+                scores.append(0.95 if moment.scene_evidence.get("near_road") else 0.05)
+            return scores
+
+        with mock.patch("surveillance_search.indexer.qwen_feature_available", return_value=True), mock.patch(
+            "surveillance_search.indexer.rerank_moments_with_qwen",
+            side_effect=_mock_rerank,
+        ):
+            results = search_index(
+                case_root,
+                query_text="person in red sweater near the road",
+                search_mode="person",
+                top_k=2,
+                use_qwen_reranker=True,
+            )
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0]["track_id"], "1")
+        self.assertTrue(results[0]["qwen_reranker_used"])
+        self.assertGreater(results[0]["qwen_rerank_score"], results[1]["qwen_rerank_score"])
 
         shutil.rmtree(temp_root, ignore_errors=True)
 

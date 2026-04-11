@@ -16,6 +16,10 @@ class SearchRequest(BaseModel):
     top_k: int = Field(default=5, ge=1, le=50)
     search_mode: str = Field(default="default", pattern="^(default|person)$")
     weights: dict[str, float] | None = None
+    use_qwen_parser: bool = False
+    use_qwen_reranker: bool = False
+    qwen_rerank_limit: int = Field(default=20, ge=1, le=50)
+    qwen_device: str | None = None
 
     @model_validator(mode="after")
     def validate_query(self):
@@ -65,6 +69,10 @@ def create_app(output_dir: str | Path) -> FastAPI:
                     top_k=payload.top_k,
                     weights=payload.weights,
                     search_mode=payload.search_mode,
+                    use_qwen_parser=payload.use_qwen_parser,
+                    use_qwen_reranker=payload.use_qwen_reranker,
+                    qwen_rerank_limit=payload.qwen_rerank_limit,
+                    qwen_device=payload.qwen_device,
                 )
             }
         except Exception as exc:
@@ -80,17 +88,28 @@ def create_app(output_dir: str | Path) -> FastAPI:
                 top_k=max(payload.rank, payload.top_k),
                 weights=payload.weights,
                 search_mode=payload.search_mode,
+                use_qwen_parser=payload.use_qwen_parser,
+                use_qwen_reranker=payload.use_qwen_reranker,
+                qwen_rerank_limit=payload.qwen_rerank_limit,
+                qwen_device=payload.qwen_device,
             )
             if len(results) < payload.rank:
                 raise ValueError("Requested rank exceeds available results.")
 
             chosen = results[payload.rank - 1]
             output_path = Path(payload.output_path)
+            answer_window = chosen.get("answer_window") or {}
+            if answer_window:
+                start_second = max(float(answer_window.get("start_second", chosen["start_second"])) - payload.padding, 0.0)
+                duration_seconds = max(float(answer_window.get("duration_seconds", payload.duration)) + payload.padding, 0.1)
+            else:
+                start_second = max(chosen["start_second"] - payload.padding, 0.0)
+                duration_seconds = payload.duration
             clip_path = extract_clip(
                 video_path=Path(chosen["video_path"]),
                 output_path=output_path,
-                start_second=max(chosen["start_second"] - payload.padding, 0.0),
-                duration_seconds=payload.duration,
+                start_second=start_second,
+                duration_seconds=duration_seconds,
                 ffmpeg_bin=payload.ffmpeg_bin,
             )
             return {"clip_path": str(clip_path), "result": chosen}

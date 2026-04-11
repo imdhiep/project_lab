@@ -12,6 +12,7 @@ import streamlit as st
 try:
     from .config import default_bundle_root, project_root
     from .indexer import load_bundle, search_index
+    from .qwen_integration import qwen_feature_available
 except ImportError:
     package_root = Path(__file__).resolve().parents[1]
     if str(package_root) not in sys.path:
@@ -19,6 +20,7 @@ except ImportError:
 
     from surveillance_search.config import default_bundle_root, project_root
     from surveillance_search.indexer import load_bundle, search_index
+    from surveillance_search.qwen_integration import qwen_feature_available
 
 
 DEFAULT_QUERY = "person in red shirt near the road"
@@ -309,7 +311,7 @@ def _render_header(bundle: dict) -> None:
     )
 
 
-def _render_sidebar(bundle_dir: str, bundle: dict, bundle_stats: dict) -> tuple[str, int, str]:
+def _render_sidebar(bundle_dir: str, bundle: dict, bundle_stats: dict) -> tuple[str, int, str, bool, bool]:
     with st.sidebar:
         st.markdown("### Search Controls")
         st.caption("Keep the sidebar for setup and filters so the main canvas can focus on evidence.")
@@ -344,6 +346,20 @@ def _render_sidebar(bundle_dir: str, bundle: dict, bundle_stats: dict) -> tuple[
                 )
 
         with st.expander("Advanced guidance", expanded=False):
+            qwen_parser_available = qwen_feature_available("parser")
+            qwen_reranker_available = qwen_feature_available("reranker")
+            use_qwen_parser = st.checkbox(
+                "Use local Qwen query parser",
+                value=qwen_parser_available,
+                disabled=not qwen_parser_available,
+                help="Best for Vietnamese or attribute-heavy person queries. The parser rewrites the query into structured surveillance constraints.",
+            )
+            use_qwen_reranker = st.checkbox(
+                "Use local Qwen reranker",
+                value=qwen_reranker_available,
+                disabled=not qwen_reranker_available,
+                help="Slower, but usually better for final ranking quality on person queries because it judges the top candidates directly.",
+            )
             st.markdown(
                 """
                 - Use short, concrete language for the most reliable matches.
@@ -351,8 +367,16 @@ def _render_sidebar(bundle_dir: str, bundle: dict, bundle_stats: dict) -> tuple[
                 - If the dataset only labels generic people, the app will warn when attributes like clothing color are unsupported.
                 """
             )
+            if qwen_parser_available or qwen_reranker_available:
+                st.caption(
+                    "Qwen local stack is available. For accuracy-first Vietnamese search, keep both options enabled."
+                )
+            else:
+                st.caption(
+                    "No local Qwen models were found under `./models`, so the app will stay on the faster retrieval-only path."
+                )
 
-    return bundle_dir, top_k, search_mode
+    return bundle_dir, top_k, search_mode, use_qwen_parser, use_qwen_reranker
 
 
 def _hero_metric(label: str, value: str, hint: str) -> None:
@@ -372,6 +396,24 @@ def _format_percent(value: float | None) -> str:
     if value is None:
         return "N/A"
     return f"{value * 100:.0f}%"
+
+
+def _query_requested(item: dict, kind: str) -> bool:
+    requirements = item.get("query_requirements") or {}
+    if kind == "attribute":
+        return bool(requirements.get("attribute_terms"))
+    if kind == "scene":
+        return bool(requirements.get("scene_terms"))
+    return False
+
+
+def _format_evidence_metric(item: dict, kind: str) -> str:
+    if kind == "person":
+        return _format_percent(item.get("person_match"))
+    if not _query_requested(item, kind):
+        return "Not asked"
+    field = "attribute_match" if kind == "attribute" else "scene_match"
+    return _format_percent(item.get(field))
 
 
 def _render_search_form(bundle: dict) -> tuple[str, str | None, bool]:
@@ -449,6 +491,16 @@ def _render_media(path: str | None, title: str, empty_message: str) -> None:
         )
 
 
+def _answer_window_text(item: dict) -> str | None:
+    window = item.get("answer_window") or {}
+    if not window:
+        return None
+    return (
+        f"Answer window: `{window.get('start_second', 0):.2f}s` to "
+        f"`{window.get('end_second', 0):.2f}s`"
+    )
+
+
 def _result_summary_text(item: dict) -> str:
     frame_info = item.get("frame_info", {})
     location = frame_info.get("location") or item.get("location") or "unknown"
@@ -463,7 +515,7 @@ def _result_summary_text(item: dict) -> str:
 
 
 def _result_has_preview(item: dict) -> bool:
-    for key in ("frame_path", "visual_path", "crop_path"):
+    for key in ("answer_visual_path", "answer_context_frame_path", "frame_path", "visual_path", "crop_path"):
         value = item.get(key)
         if value and Path(value).exists():
             return True
@@ -530,12 +582,14 @@ def _render_top_match(item: dict, query_text: str, assessment: dict) -> None:
         else:
             st.info(assessment["summary"])
         _render_media(
-            item.get("frame_path") or item.get("visual_path"),
-            "Primary frame preview",
+            item.get("answer_visual_path") or item.get("frame_path") or item.get("visual_path"),
+            "Best answer frame",
             "No frame preview is available for this top-ranked track in the current bundle.",
         )
+        if item.get("answer_context_frame_path"):
+            st.image(item["answer_context_frame_path"], caption="Context frame", width="stretch")
         crop_path = item.get("crop_path")
-        if crop_path and Path(crop_path).exists():
+        if crop_path and Path(crop_path).exists() and crop_path != item.get("answer_visual_path"):
             st.image(crop_path, caption="Track crop", width="stretch")
 
     with right:
@@ -551,6 +605,9 @@ def _render_top_match(item: dict, query_text: str, assessment: dict) -> None:
         )
         if item.get("result_warning"):
             st.warning(item["result_warning"])
+        answer_window = _answer_window_text(item)
+        if answer_window:
+            st.caption(answer_window)
 
         stats_one, stats_two = st.columns(2, gap="small")
         with stats_one:
@@ -562,13 +619,19 @@ def _render_top_match(item: dict, query_text: str, assessment: dict) -> None:
             }
             quality = quality_map.get(item.get("match_quality"), "Evidence-backed")
             _hero_metric("Match quality", quality, "What kind of answer this result represents.")
-            _hero_metric("Person evidence", _format_percent(item.get("person_match")), "How strongly the result looks like a person track.")
+            _hero_metric("Person evidence", _format_evidence_metric(item, "person"), "How strongly the result looks like a person track.")
         with stats_two:
-            _hero_metric("Attribute evidence", _format_percent(item.get("attribute_match")), "How much of the requested appearance evidence is verified.")
-            _hero_metric("Scene evidence", _format_percent(item.get("scene_match")), "How much of the requested scene relation evidence is verified.")
+            _hero_metric("Attribute evidence", _format_evidence_metric(item, "attribute"), "How much of the requested appearance evidence is verified.")
+            _hero_metric("Scene evidence", _format_evidence_metric(item, "scene"), "How much of the requested scene relation evidence is verified.")
 
         st.caption(f"Verified attributes: {_evidence_list_text(item.get('verified_attributes'))}")
         st.caption(f"Scene relations: {_evidence_list_text(item.get('verified_scene_relations'))}")
+        if item.get("query_profile"):
+            st.caption(f"Query intent: {item['query_profile'].get('primary_intent', 'unknown')}")
+        if item.get("structured_query"):
+            st.caption(f"Qwen parsed query: {json.dumps(item['structured_query'], ensure_ascii=False)}")
+        if item.get("qwen_rerank_used"):
+            st.caption(f"Qwen rerank score: {item.get('qwen_rerank_score', 0.0):.3f}")
 
         st.markdown(
             f"""
@@ -597,10 +660,13 @@ def _render_ranked_result(item: dict, rank: int) -> None:
             unsafe_allow_html=True,
         )
         quick_cols = st.columns(4)
-        quick_cols[0].metric("Score", f"{item['score']:.4f}")
-        quick_cols[1].metric("Person", _format_percent(item.get("person_match")))
-        quick_cols[2].metric("Attributes", _format_percent(item.get("attribute_match")))
-        quick_cols[3].metric("Scene", _format_percent(item.get("scene_match")))
+        quick_cols[0].metric("Rank score", f"{item['score']:.4f}")
+        quick_cols[1].metric("Person", _format_evidence_metric(item, "person"))
+        quick_cols[2].metric("Attributes", _format_evidence_metric(item, "attribute"))
+        quick_cols[3].metric("Scene", _format_evidence_metric(item, "scene"))
+        answer_window = _answer_window_text(item)
+        if answer_window:
+            st.caption(answer_window)
         if item.get("result_warning"):
             st.caption(item["result_warning"])
         st.caption(
@@ -610,8 +676,8 @@ def _render_ranked_result(item: dict, rank: int) -> None:
             media_col, detail_col = st.columns([1.1, 0.9], gap="large")
             with media_col:
                 _render_media(
-                    item.get("frame_path") or item.get("visual_path"),
-                    "Frame preview",
+                    item.get("answer_visual_path") or item.get("frame_path") or item.get("visual_path"),
+                    "Best answer frame",
                     "This result does not have a frame preview in the current bundle.",
                 )
             with detail_col:
@@ -629,6 +695,14 @@ def _render_ranked_result(item: dict, rank: int) -> None:
                         "scene_match": item.get("scene_match"),
                         "verified_attributes": item.get("verified_attributes"),
                         "verified_scene_relations": item.get("verified_scene_relations"),
+                        "query_profile": item.get("query_profile"),
+                        "answer_visual_path": item.get("answer_visual_path"),
+                        "answer_asset_type": item.get("answer_asset_type"),
+                        "answer_frame_idx": item.get("answer_frame_idx"),
+                        "answer_second": item.get("answer_second"),
+                        "answer_window": item.get("answer_window"),
+                        "answer_selection": item.get("answer_selection"),
+                        "query_requirements": item.get("query_requirements"),
                         "attribute_evidence": item.get("attribute_evidence"),
                         "scene_evidence": item.get("scene_evidence"),
                         "match_quality": item.get("match_quality"),
@@ -642,8 +716,11 @@ def _render_overview(results: list[dict], query_text: str, search_mode: str) -> 
     metrics = st.columns(4)
     metrics[0].metric("Results shown", str(len(results)))
     metrics[1].metric("Result type", "Generic only" if assessment["generic_only"] else "Best match")
-    metrics[2].metric("Best person evidence", _format_percent(top.get("person_match")))
-    metrics[3].metric("Verified evidence", _format_percent(max(top.get("attribute_match") or 0.0, top.get("scene_match") or 0.0)))
+    metrics[2].metric("Best person evidence", _format_evidence_metric(top, "person"))
+    if _query_requested(top, "attribute") or _query_requested(top, "scene"):
+        metrics[3].metric("Verified evidence", _format_percent(max(top.get("attribute_match") or 0.0, top.get("scene_match") or 0.0)))
+    else:
+        metrics[3].metric("Verified evidence", "Not asked")
 
     if search_mode == "person":
         st.caption(
@@ -690,11 +767,33 @@ def _render_diagnostics(results: list[dict], bundle: dict) -> None:
                 "scene_match": top.get("scene_match"),
                 "verified_attributes": top.get("verified_attributes"),
                 "verified_scene_relations": top.get("verified_scene_relations"),
+                "structured_query": top.get("structured_query"),
+                "qwen_parser_used": top.get("qwen_parser_used"),
+                "qwen_reranker_used": top.get("qwen_reranker_used"),
+                "qwen_rerank_score": top.get("qwen_rerank_score"),
+                "qwen_parser_error": top.get("qwen_parser_error"),
+                "qwen_reranker_error": top.get("qwen_reranker_error"),
+                "query_requirements": top.get("query_requirements"),
+                "query_profile": top.get("query_profile"),
+                "answer_visual_path": top.get("answer_visual_path"),
+                "answer_asset_type": top.get("answer_asset_type"),
+                "answer_frame_idx": top.get("answer_frame_idx"),
+                "answer_second": top.get("answer_second"),
+                "answer_window": top.get("answer_window"),
+                "answer_selection": top.get("answer_selection"),
             }
         )
 
 
-def _run_search(bundle_dir: str, query_text: str, image_path: str | None, top_k: int, search_mode: str) -> None:
+def _run_search(
+    bundle_dir: str,
+    query_text: str,
+    image_path: str | None,
+    top_k: int,
+    search_mode: str,
+    use_qwen_parser: bool,
+    use_qwen_reranker: bool,
+) -> None:
     with st.spinner("Ranking the most relevant tracks..."):
         results = search_index(
             Path(bundle_dir),
@@ -702,6 +801,8 @@ def _run_search(bundle_dir: str, query_text: str, image_path: str | None, top_k:
             query_image_path=image_path,
             top_k=top_k,
             search_mode=search_mode,
+            use_qwen_parser=use_qwen_parser,
+            use_qwen_reranker=use_qwen_reranker,
         )
     st.session_state["search_results"] = results
     st.session_state["query_text"] = query_text
@@ -736,7 +837,7 @@ def main() -> None:
     bundle_stats = _load_bundle_stats(initial_bundle_dir)
 
     _render_header(bundle)
-    bundle_dir, top_k, search_mode = _render_sidebar(initial_bundle_dir, bundle, bundle_stats)
+    bundle_dir, top_k, search_mode, use_qwen_parser, use_qwen_reranker = _render_sidebar(initial_bundle_dir, bundle, bundle_stats)
 
     if bundle_dir != initial_bundle_dir:
         try:
@@ -753,7 +854,15 @@ def main() -> None:
             st.warning("Nhập mô tả hoặc thêm ảnh tham chiếu để bắt đầu.")
         else:
             try:
-                _run_search(bundle_dir, query_text, image_path, top_k, search_mode)
+                _run_search(
+                    bundle_dir,
+                    query_text,
+                    image_path,
+                    top_k,
+                    search_mode,
+                    use_qwen_parser,
+                    use_qwen_reranker,
+                )
             except Exception as exc:
                 st.error(str(exc))
 

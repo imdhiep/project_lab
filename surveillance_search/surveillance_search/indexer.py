@@ -4,6 +4,7 @@ import json
 import pickle
 from pathlib import Path
 
+from .answer_selection import annotate_results_with_answer_selection
 from .config import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_CLIP_MODEL,
@@ -12,6 +13,11 @@ from .config import (
 )
 from .enrichment import evidence_terms, summarize_attribute_evidence, summarize_scene_evidence
 from .models import Moment
+from .qwen_integration import (
+    parse_person_query_with_qwen,
+    qwen_feature_available,
+    rerank_moments_with_qwen,
+)
 from .video_tools import build_frame_info, select_crop_path, select_frame_path, select_visual_path, summarize_captions
 from .vision import encode_images_clip, encode_texts_clip, encode_texts_sentence_transformer
 
@@ -28,6 +34,7 @@ PERSON_MODE_FLOOR = 0.7
 PERSON_ATTRIBUTE_GATE_FLOOR = 0.08
 ATTRIBUTE_EVIDENCE_GATE_FLOOR = 0.2
 SCENE_EVIDENCE_GATE_FLOOR = 0.2
+QWEN_RERANK_BLEND = 0.45
 QUERY_STOPWORDS = frozenset(
     {
         "a",
@@ -688,6 +695,28 @@ def _ranked_indices_with_person_filter(combined, person_scores, top_k: int):
     return ranked[:top_k]
 
 
+def _apply_qwen_rerank(
+    combined,
+    ranked_indices,
+    rerank_scores: list[float],
+):
+    np = _np()
+    ranked_indices = np.asarray(ranked_indices, dtype="int32")
+    if ranked_indices.size == 0 or not rerank_scores:
+        return ranked_indices, {}, {}
+
+    rerank_vector = np.asarray(rerank_scores, dtype="float32")
+    candidate_scores = np.asarray([combined[int(index)] for index in ranked_indices], dtype="float32")
+    base_norm = _normalize_scores(candidate_scores)
+    rerank_norm = _normalize_scores(rerank_vector)
+    fused = ((1.0 - QWEN_RERANK_BLEND) * base_norm) + (QWEN_RERANK_BLEND * rerank_norm)
+    order = np.argsort(-fused, kind="stable")
+    reranked_indices = ranked_indices[order]
+    rerank_lookup = {int(ranked_indices[i]): float(rerank_vector[i]) for i in range(len(ranked_indices))}
+    fused_lookup = {int(ranked_indices[i]): float(fused[i]) for i in range(len(ranked_indices))}
+    return reranked_indices, rerank_lookup, fused_lookup
+
+
 def search_index(
     output_dir: Path,
     query_text: str | None = None,
@@ -695,6 +724,10 @@ def search_index(
     top_k: int = 5,
     weights: dict[str, float] | None = None,
     search_mode: str = "default",
+    use_qwen_parser: bool = False,
+    use_qwen_reranker: bool = False,
+    qwen_rerank_limit: int = 20,
+    qwen_device: str | None = None,
 ) -> list[dict]:
     if not query_text and not query_image_path:
         raise ValueError("Provide `query_text` and/or `query_image_path`.")
@@ -703,7 +736,26 @@ def search_index(
     bundle = load_bundle(output_dir)
     moments = _load_moments(Path(bundle["moments_path"]))
     score_vectors: dict[str, object] = {}
-    effective_query_text = _expand_query_text(query_text, search_mode) if query_text else None
+    parser_payload = None
+    query_text_for_matching = query_text
+    qwen_parser_used = False
+    qwen_reranker_used = False
+    qwen_parser_error = None
+    qwen_reranker_error = None
+    if query_text and search_mode == "person" and use_qwen_parser and qwen_feature_available("parser"):
+        try:
+            parser_payload = parse_person_query_with_qwen(
+                query_text,
+                device=qwen_device,
+            )
+            normalized_query = str(parser_payload.get("normalized_query") or "").strip()
+            if normalized_query:
+                query_text_for_matching = normalized_query
+            qwen_parser_used = True
+        except Exception as exc:
+            qwen_parser_error = str(exc)
+
+    effective_query_text = _expand_query_text(query_text_for_matching, search_mode) if query_text_for_matching else None
 
     if effective_query_text and _artifact_enabled(bundle, "sparse"):
         score_vectors["sparse"] = _search_sparse_scores(bundle, effective_query_text)
@@ -722,8 +774,8 @@ def search_index(
 
     combined, normalized, fusion_breakdown, resolved_weights = _fuse_score_vectors(score_vectors, weights)
     precision_scores = None
-    if query_text:
-        precision_scores = _compute_text_precision_scores(query_text, moments, search_mode)
+    if query_text_for_matching:
+        precision_scores = _compute_text_precision_scores(query_text_for_matching, moments, search_mode)
         if _should_apply_text_precision_gate(score_vectors):
             combined = _apply_text_precision_gate(combined, precision_scores)
         if search_mode == "person":
@@ -731,7 +783,7 @@ def search_index(
                 combined,
                 moments,
                 precision_scores,
-                query_text,
+                query_text_for_matching,
                 search_mode,
             )
     attribute_scores = None
@@ -739,9 +791,9 @@ def search_index(
     requirements = None
     person_scores = None
     if search_mode == "person":
-        if query_text:
+        if query_text_for_matching:
             attribute_scores, scene_scores, requirements = _attribute_scene_match_scores(
-                query_text,
+                query_text_for_matching,
                 moments,
                 search_mode,
             )
@@ -763,6 +815,33 @@ def search_index(
     else:
         ranked_indices = np.argsort(-combined)[: min(top_k, len(moments))]
 
+    rerank_score_lookup: dict[int, float] = {}
+    rerank_fused_lookup: dict[int, float] = {}
+    if (
+        query_text_for_matching
+        and use_qwen_reranker
+        and qwen_feature_available("reranker")
+        and len(ranked_indices) > 1
+    ):
+        rerank_limit = min(max(top_k * 4, top_k), max(qwen_rerank_limit, top_k), len(ranked_indices))
+        rerank_indices = np.asarray(ranked_indices[:rerank_limit], dtype="int32")
+        try:
+            rerank_scores = rerank_moments_with_qwen(
+                query_text=query_text_for_matching,
+                moments=[moments[int(index)] for index in rerank_indices],
+                device=qwen_device,
+            )
+            reranked_subset, rerank_score_lookup, rerank_fused_lookup = _apply_qwen_rerank(
+                combined,
+                rerank_indices,
+                rerank_scores,
+            )
+            trailing = [int(index) for index in ranked_indices if int(index) not in set(int(item) for item in rerank_indices)]
+            ranked_indices = np.asarray([*reranked_subset.tolist(), *trailing], dtype="int32")
+            qwen_reranker_used = True
+        except Exception as exc:
+            qwen_reranker_error = str(exc)
+
     results = []
     for index in ranked_indices:
         raw_breakdown = {key: float(score_vectors[key][index]) for key in score_vectors}
@@ -771,7 +850,7 @@ def search_index(
         results.append(
             _format_result(
                 moment=moments[int(index)],
-                score=float(combined[index]),
+                score=float(rerank_fused_lookup.get(int(index), combined[index])),
                 score_breakdown=raw_breakdown,
                 normalized_breakdown=norm_breakdown,
                 weights=resolved_weights,
@@ -780,11 +859,33 @@ def search_index(
                 person_match=float(person_scores[index]) if person_scores is not None else None,
                 fusion_breakdown=fused_breakdown,
                 precision_match=float(precision_scores[index]) if precision_scores is not None else None,
-                query_text=query_text,
+                query_text=query_text_for_matching,
                 attribute_match=float(attribute_scores[index]) if attribute_scores is not None else None,
                 scene_match=float(scene_scores[index]) if scene_scores is not None else None,
+                structured_query=parser_payload,
+                qwen_parser_used=qwen_parser_used,
+                qwen_reranker_used=qwen_reranker_used,
+                qwen_rerank_score=rerank_score_lookup.get(int(index)),
+                qwen_parser_error=qwen_parser_error,
+                qwen_reranker_error=qwen_reranker_error,
+                query_requirements=requirements,
             )
         )
+        if len(results) >= top_k:
+            break
+    clip_artifact = bundle.get("artifacts", {}).get("clip", {})
+    clip_model_name = clip_artifact.get("model_name") or bundle["defaults"].get("clip_model_name", DEFAULT_CLIP_MODEL)
+    clip_pretrained = clip_artifact.get("pretrained") or bundle["defaults"].get("clip_pretrained", DEFAULT_CLIP_PRETRAINED)
+    annotate_results_with_answer_selection(
+        results=results,
+        query_text=query_text_for_matching,
+        search_mode=search_mode,
+        structured_query=parser_payload,
+        clip_model_name=clip_model_name,
+        clip_pretrained=clip_pretrained,
+        device=bundle["defaults"].get("device"),
+        batch_size=bundle["defaults"].get("batch_size", DEFAULT_BATCH_SIZE),
+    )
     return results
 
 
@@ -861,6 +962,13 @@ def _format_result(
     query_text: str | None = None,
     attribute_match: float | None = None,
     scene_match: float | None = None,
+    structured_query: dict[str, object] | None = None,
+    qwen_parser_used: bool = False,
+    qwen_reranker_used: bool = False,
+    qwen_rerank_score: float | None = None,
+    qwen_parser_error: str | None = None,
+    qwen_reranker_error: str | None = None,
+    query_requirements: dict[str, object] | None = None,
 ) -> dict:
     payload = moment.to_dict()
     frame_path = select_frame_path(moment)
@@ -892,6 +1000,24 @@ def _format_result(
         payload["attribute_match"] = round(attribute_match, 6)
     if scene_match is not None:
         payload["scene_match"] = round(scene_match, 6)
+    if structured_query:
+        payload["structured_query"] = structured_query
+    if qwen_parser_used:
+        payload["qwen_parser_used"] = True
+    if qwen_reranker_used:
+        payload["qwen_reranker_used"] = True
+    if qwen_rerank_score is not None:
+        payload["qwen_rerank_score"] = round(float(qwen_rerank_score), 6)
+    if qwen_parser_error:
+        payload["qwen_parser_error"] = qwen_parser_error
+    if qwen_reranker_error:
+        payload["qwen_reranker_error"] = qwen_reranker_error
+    if query_requirements is not None:
+        payload["query_requirements"] = {
+            "attribute_terms": sorted(str(term) for term in query_requirements.get("attribute_terms", set())),
+            "scene_terms": sorted(str(term) for term in query_requirements.get("scene_terms", set())),
+            "needs_near_road": bool(query_requirements.get("needs_near_road", False)),
+        }
     if moment.attribute_evidence:
         payload["attribute_evidence"] = moment.attribute_evidence
         payload["verified_attributes"] = summarize_attribute_evidence(moment.attribute_evidence)

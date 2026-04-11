@@ -27,6 +27,7 @@ from .dataset import collect_moments, download_from_huggingface
 from .enrichment import apply_enrichment
 from .enrichment_inference import infer_and_write_enrichment
 from .indexer import build_search_bundle, search_index
+from .qwen_integration import local_qwen_embedding_model
 from .runtime import RuntimeConfig, rebuild_runtime_bundle, watch_and_rebuild
 from .video_tools import (
     attach_existing_visual_assets,
@@ -90,6 +91,17 @@ def resolve_assets_dir(args: argparse.Namespace) -> Path:
     return default_visual_root()
 
 
+def resolve_sentence_model_name(args: argparse.Namespace) -> str:
+    if getattr(args, "use_qwen_embedding", False):
+        model_path = local_qwen_embedding_model()
+        if not model_path:
+            raise FileNotFoundError(
+                "Local Qwen embedding model was requested but not found under ./models/Qwen3-Embedding-4B."
+            )
+        return model_path
+    return args.sentence_model
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Full-featured surveillance multimodal search engine")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -119,6 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
     bootstrap_parser.add_argument("--max-assets-per-moment", type=int, default=DEFAULT_MAX_ASSETS_PER_MOMENT)
     bootstrap_parser.add_argument("--crop-padding", type=float, default=0.08)
     bootstrap_parser.add_argument("--sentence-model", default=DEFAULT_SENTENCE_MODEL)
+    bootstrap_parser.add_argument("--use-qwen-embedding", action="store_true", help="Use the local ./models/Qwen3-Embedding-4B directory as the dense embedding model.")
     bootstrap_parser.add_argument("--clip-model", default=DEFAULT_CLIP_MODEL)
     bootstrap_parser.add_argument("--clip-pretrained", default=DEFAULT_CLIP_PRETRAINED)
     bootstrap_parser.add_argument("--device", default=None)
@@ -155,6 +168,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_parser_cmd.add_argument("--max-assets-per-moment", type=int, default=DEFAULT_MAX_ASSETS_PER_MOMENT)
     build_parser_cmd.add_argument("--crop-padding", type=float, default=0.08)
     build_parser_cmd.add_argument("--sentence-model", default=DEFAULT_SENTENCE_MODEL)
+    build_parser_cmd.add_argument("--use-qwen-embedding", action="store_true", help="Use the local ./models/Qwen3-Embedding-4B directory as the dense embedding model.")
     build_parser_cmd.add_argument("--clip-model", default=DEFAULT_CLIP_MODEL)
     build_parser_cmd.add_argument("--clip-pretrained", default=DEFAULT_CLIP_PRETRAINED)
     build_parser_cmd.add_argument("--device", default=None)
@@ -173,6 +187,10 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--search-mode", choices=("default", "person"), default="default")
     search_parser.add_argument("--weights", default=None, help="Example: sparse=0.1,dense=0.4,clip_text=0.2,clip_image=0.3")
     search_parser.add_argument("--json", action="store_true")
+    search_parser.add_argument("--use-qwen-parser", action="store_true", help="Use local Qwen3 query parsing for better multilingual person-query understanding.")
+    search_parser.add_argument("--use-qwen-reranker", action="store_true", help="Use local Qwen3 reranking on the top search candidates.")
+    search_parser.add_argument("--qwen-rerank-limit", type=int, default=20)
+    search_parser.add_argument("--qwen-device", default=None)
 
     clip_parser = subparsers.add_parser("clip", help="Extract a clip from a retrieved result")
     clip_parser.add_argument("--output-dir", default=str(default_bundle_root()))
@@ -186,6 +204,10 @@ def build_parser() -> argparse.ArgumentParser:
     clip_parser.add_argument("--padding", type=float, default=0.5)
     clip_parser.add_argument("--output", required=True)
     clip_parser.add_argument("--ffmpeg-bin", default="ffmpeg")
+    clip_parser.add_argument("--use-qwen-parser", action="store_true", help="Use local Qwen3 query parsing for better multilingual person-query understanding.")
+    clip_parser.add_argument("--use-qwen-reranker", action="store_true", help="Use local Qwen3 reranking on the top search candidates.")
+    clip_parser.add_argument("--qwen-rerank-limit", type=int, default=20)
+    clip_parser.add_argument("--qwen-device", default=None)
 
     api_parser = subparsers.add_parser("serve-api", help="Run FastAPI service")
     api_parser.add_argument("--output-dir", default=str(default_bundle_root()))
@@ -206,6 +228,7 @@ def build_parser() -> argparse.ArgumentParser:
     rebuild_parser.add_argument("--max-assets-per-moment", type=int, default=DEFAULT_MAX_ASSETS_PER_MOMENT)
     rebuild_parser.add_argument("--crop-padding", type=float, default=0.08)
     rebuild_parser.add_argument("--sentence-model", default=DEFAULT_SENTENCE_MODEL)
+    rebuild_parser.add_argument("--use-qwen-embedding", action="store_true", help="Use the local ./models/Qwen3-Embedding-4B directory as the dense embedding model.")
     rebuild_parser.add_argument("--clip-model", default=DEFAULT_CLIP_MODEL)
     rebuild_parser.add_argument("--clip-pretrained", default=DEFAULT_CLIP_PRETRAINED)
     rebuild_parser.add_argument("--device", default=None)
@@ -229,6 +252,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser.add_argument("--max-assets-per-moment", type=int, default=DEFAULT_MAX_ASSETS_PER_MOMENT)
     watch_parser.add_argument("--crop-padding", type=float, default=0.08)
     watch_parser.add_argument("--sentence-model", default=DEFAULT_SENTENCE_MODEL)
+    watch_parser.add_argument("--use-qwen-embedding", action="store_true", help="Use the local ./models/Qwen3-Embedding-4B directory as the dense embedding model.")
     watch_parser.add_argument("--clip-model", default=DEFAULT_CLIP_MODEL)
     watch_parser.add_argument("--clip-pretrained", default=DEFAULT_CLIP_PRETRAINED)
     watch_parser.add_argument("--device", default=None)
@@ -289,7 +313,7 @@ def _runtime_config_from_args(args: argparse.Namespace) -> RuntimeConfig:
         enable_sparse=enable_sparse,
         enable_dense=enable_dense,
         enable_clip=enable_clip,
-        sentence_model_name=args.sentence_model,
+        sentence_model_name=resolve_sentence_model_name(args),
         clip_model_name=args.clip_model,
         clip_pretrained=args.clip_pretrained,
         device=args.device,
@@ -415,7 +439,7 @@ def command_build(args: argparse.Namespace) -> None:
         enable_sparse=enable_sparse,
         enable_dense=enable_dense,
         enable_clip=enable_clip,
-        sentence_model_name=args.sentence_model,
+        sentence_model_name=resolve_sentence_model_name(args),
         clip_model_name=args.clip_model,
         clip_pretrained=args.clip_pretrained,
         device=args.device,
@@ -434,6 +458,10 @@ def command_search(args: argparse.Namespace) -> None:
         top_k=args.top_k,
         weights=parse_weights(args.weights),
         search_mode=args.search_mode,
+        use_qwen_parser=args.use_qwen_parser,
+        use_qwen_reranker=args.use_qwen_reranker,
+        qwen_rerank_limit=args.qwen_rerank_limit,
+        qwen_device=args.qwen_device,
     )
 
     if args.json:
@@ -462,17 +490,27 @@ def command_clip(args: argparse.Namespace) -> None:
         top_k=max(args.rank, args.top_k),
         weights=parse_weights(args.weights),
         search_mode=args.search_mode,
+        use_qwen_parser=args.use_qwen_parser,
+        use_qwen_reranker=args.use_qwen_reranker,
+        qwen_rerank_limit=args.qwen_rerank_limit,
+        qwen_device=args.qwen_device,
     )
     if len(results) < args.rank:
         raise ValueError("Requested rank exceeds number of search results.")
 
     chosen = results[args.rank - 1]
-    start_second = max(chosen["start_second"] - args.padding, 0.0)
+    answer_window = chosen.get("answer_window") or {}
+    if answer_window:
+        start_second = max(float(answer_window.get("start_second", chosen["start_second"])) - args.padding, 0.0)
+        duration = max(float(answer_window.get("duration_seconds", args.duration)) + args.padding, 0.1)
+    else:
+        start_second = max(chosen["start_second"] - args.padding, 0.0)
+        duration = args.duration
     clip_path = extract_clip(
         video_path=Path(chosen["video_path"]),
         output_path=Path(args.output),
         start_second=start_second,
-        duration_seconds=args.duration,
+        duration_seconds=duration,
         ffmpeg_bin=args.ffmpeg_bin,
     )
     print(f"Clip exported to {clip_path}")
