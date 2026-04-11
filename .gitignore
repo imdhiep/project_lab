@@ -17,3 +17,5 @@ build/
 
 # AI logs — tracked structure, ignored content
 .ai-log/*.jsonl
+surveillance_search/data/bdd100k/*.zip
+surveillance_search/models/**/*.safetensors
