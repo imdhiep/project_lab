@@ -1,0 +1,15 @@
+{
+  "name": "scene_relation_baseline",
+  "strategy": "clip_zero_shot_baseline",
+  "supervision_dataset": "BDD100K",
+  "prepared_dataset_root": "/teamspace/studios/this_studio/project_lab/surveillance_search/data/prepared/bdd100k",
+  "output_artifact": "/teamspace/studios/this_studio/project_lab/surveillance_search/data/artifacts/models/scene_baseline.json",
+  "labels_of_interest": [
+    "near_road",
+    "drivable_area"
+  ],
+  "notes": [
+    "This baseline keeps the pipeline end-to-end with free pretrained components.",
+    "Replace with a fine-tuned drivable-area segmentation model if stronger scene grounding is needed."
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "name": "person_attribute_baseline",
+  "strategy": "clip_zero_shot_baseline",
+  "supervision_dataset": "PA-100K",
+  "prepared_dataset_root": "/teamspace/studios/this_studio/project_lab/surveillance_search/data/prepared/pa100k",
+  "output_artifact": "/teamspace/studios/this_studio/project_lab/surveillance_search/data/artifacts/models/attribute_baseline.json",
+  "labels_of_interest": [
+    "top_color",
+    "top_type",
+    "backpack",
+    "bag",
+    "hat"
+  ],
+  "notes": [
+    "This is a baseline scaffold, not a heavy supervised trainer.",
+    "Replace the strategy with a fine-tuned PA-100K or RAPv2 model when available."
+  ]
+}

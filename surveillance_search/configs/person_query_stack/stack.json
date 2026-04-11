@@ -1,0 +1,22 @@
+{
+  "video_base_dataset": {
+    "name": "PersonPath22",
+    "root": "/teamspace/studios/this_studio/project_lab/surveillance_search/data/personpath22"
+  },
+  "attribute_supervision": {
+    "name": "PA-100K",
+    "raw_root": "/teamspace/studios/this_studio/project_lab/surveillance_search/data/pa100k",
+    "prepared_root": "/teamspace/studios/this_studio/project_lab/surveillance_search/data/prepared/pa100k",
+    "config": "/teamspace/studios/this_studio/project_lab/surveillance_search/configs/person_query_stack/attribute_model.json"
+  },
+  "scene_supervision": {
+    "name": "BDD100K",
+    "raw_root": "/teamspace/studios/this_studio/project_lab/surveillance_search/data/bdd100k",
+    "prepared_root": "/teamspace/studios/this_studio/project_lab/surveillance_search/data/prepared/bdd100k",
+    "config": "/teamspace/studios/this_studio/project_lab/surveillance_search/configs/person_query_stack/scene_model.json"
+  },
+  "bundle_output": "/teamspace/studios/this_studio/project_lab/surveillance_search/data/artifacts/full",
+  "visual_assets": "/teamspace/studios/this_studio/project_lab/surveillance_search/data/artifacts/visual_assets",
+  "models_root": "/teamspace/studios/this_studio/project_lab/surveillance_search/data/artifacts/models",
+  "end_to_end_build_command": "python -m surveillance_search build --dataset-type personpath22 --profile strongest --auto-enrich"
+}
