@@ -6,13 +6,17 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .dataset import collect_moments, iter_label_files
+from .config import DEFAULT_DATASET_TYPE
+from .dataset import collect_moments, iter_dataset_source_files
+from .enrichment import apply_enrichment
+from .enrichment_inference import infer_and_write_enrichment
 from .indexer import build_search_bundle
-from .video_tools import extract_visual_assets
+from .video_tools import attach_existing_visual_assets, extract_visual_assets
 
 
 @dataclass
 class RuntimeConfig:
+    dataset_type: str
     dataset_root: Path
     output_dir: Path
     assets_dir: Path
@@ -31,6 +35,7 @@ class RuntimeConfig:
     max_assets_per_moment: int
     crop_padding: float
     ffmpeg_bin: str
+    enable_enrichment: bool = False
 
 
 def runtime_manifest_path(output_dir: Path) -> Path:
@@ -41,28 +46,29 @@ def bundle_path(output_dir: Path) -> Path:
     return output_dir / "bundle.json"
 
 
-def _video_path_from_label(label_path: Path) -> Path:
-    return label_path.with_name(f"{label_path.parent.name}.mp4")
-
-
 def snapshot_dataset_sources(
     dataset_root: Path,
+    dataset_type: str = DEFAULT_DATASET_TYPE,
     locations: list[str] | None = None,
     splits: list[str] | None = None,
 ) -> list[dict]:
     entries: list[dict] = []
-    for label_path in iter_label_files(dataset_root, locations=locations, splits=splits):
-        for source_path in (label_path, _video_path_from_label(label_path)):
-            if not source_path.exists():
-                continue
-            stat = source_path.stat()
-            entries.append(
-                {
-                    "path": source_path.relative_to(dataset_root).as_posix(),
-                    "size": stat.st_size,
-                    "mtime_ns": stat.st_mtime_ns,
-                }
-            )
+    for source_path in iter_dataset_source_files(
+        dataset_root,
+        dataset_type=dataset_type,
+        locations=locations,
+        splits=splits,
+    ):
+        if not source_path.exists():
+            continue
+        stat = source_path.stat()
+        entries.append(
+            {
+                "path": source_path.relative_to(dataset_root).as_posix(),
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+            }
+        )
     return sorted(entries, key=lambda item: item["path"])
 
 
@@ -85,6 +91,7 @@ def save_runtime_manifest(output_dir: Path, payload: dict) -> Path:
 def dataset_has_changes(config: RuntimeConfig) -> bool:
     current_sources = snapshot_dataset_sources(
         config.dataset_root,
+        dataset_type=config.dataset_type,
         locations=config.locations,
         splits=config.splits,
     )
@@ -103,9 +110,13 @@ def rebuild_runtime_bundle(config: RuntimeConfig) -> dict:
         group_by_track=config.group_by_track,
         locations=config.locations,
         splits=config.splits,
+        dataset_type=config.dataset_type,
     )
 
-    if config.enable_clip and any(Path(moment.video_path).exists() for moment in moments):
+    videos_available = any(Path(moment.video_path).exists() for moment in moments)
+
+    if (config.enable_clip or config.enable_enrichment) and videos_available:
+        attach_existing_visual_assets(moments, config.assets_dir)
         extract_visual_assets(
             moments,
             output_dir=config.assets_dir,
@@ -114,6 +125,18 @@ def rebuild_runtime_bundle(config: RuntimeConfig) -> dict:
             overwrite=False,
             ffmpeg_bin=config.ffmpeg_bin,
         )
+        attach_existing_visual_assets(moments, config.assets_dir)
+
+    if config.enable_enrichment:
+        infer_and_write_enrichment(
+            moments=moments,
+            dataset_root=config.dataset_root,
+            clip_model_name=config.clip_model_name,
+            clip_pretrained=config.clip_pretrained,
+            device=config.device,
+            batch_size=config.batch_size,
+        )
+        moments = apply_enrichment(moments, config.dataset_root)
 
     bundle_file = build_search_bundle(
         moments=moments,
@@ -133,6 +156,7 @@ def rebuild_runtime_bundle(config: RuntimeConfig) -> dict:
         "bundle_path": str(bundle_file),
         "output_dir": str(config.output_dir),
         "dataset_root": str(config.dataset_root),
+        "dataset_type": config.dataset_type,
         "assets_dir": str(config.assets_dir),
         "locations": config.locations,
         "splits": config.splits,
@@ -144,6 +168,7 @@ def rebuild_runtime_bundle(config: RuntimeConfig) -> dict:
         "moment_count": len(moments),
         "sources": snapshot_dataset_sources(
             config.dataset_root,
+            dataset_type=config.dataset_type,
             locations=config.locations,
             splits=config.splits,
         ),

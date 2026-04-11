@@ -38,6 +38,8 @@ class Moment:
     keywords: list[str] = field(default_factory=list)
     frame_paths: list[str] = field(default_factory=list)
     crop_paths: list[str] = field(default_factory=list)
+    attribute_evidence: dict = field(default_factory=dict)
+    scene_evidence: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -49,4 +51,6 @@ class Moment:
         payload.setdefault("keywords", [])
         payload.setdefault("frame_paths", [])
         payload.setdefault("crop_paths", [])
+        payload.setdefault("attribute_evidence", {})
+        payload.setdefault("scene_evidence", {})
         return cls(**payload)

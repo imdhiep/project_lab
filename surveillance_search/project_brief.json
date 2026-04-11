@@ -1,10 +1,10 @@
 {
   "ten_du_an": "Search Engine cho dữ liệu camera giám sát",
-  "benchmark_hien_tai": "LAVA Dataset",
+  "benchmark_hien_tai": "Surveillance Search Datasets",
   "mo_ta": "Hệ thống camera giám sát tạo lượng dữ liệu khổng lồ nhưng tìm kiếm sự kiện/đối tượng cụ thể vẫn phải xem thủ công. Xây dựng search engine cho ảnh/video từ camera giám sát: visual + text query, real-time indexing, semantic search.",
   "muc_tieu_mvp": [
     "Tải chọn lọc annotation/video từ Hugging Face để giảm dung lượng",
-    "Xây dựng semantic search từ caption và metadata của LAVA",
+    "Xây dựng semantic search từ caption, metadata và tracking annotations cho surveillance search",
     "Trả về moment/video phù hợp với truy vấn ngôn ngữ tự nhiên",
     "Chuẩn bị cấu trúc để mở rộng sang visual query và indexing gần real-time"
   ]

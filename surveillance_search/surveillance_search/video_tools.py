@@ -12,12 +12,64 @@ def sanitize_name(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]+", "_", value)
 
 
-def select_visual_path(moment: Moment) -> str | None:
-    if moment.crop_paths:
-        return moment.crop_paths[0]
+def select_frame_path(moment: Moment) -> str | None:
     if moment.frame_paths:
         return moment.frame_paths[0]
     return None
+
+
+def select_crop_path(moment: Moment) -> str | None:
+    if moment.crop_paths:
+        return moment.crop_paths[0]
+    return None
+
+
+def select_visual_path(moment: Moment, preference: str = "frame") -> str | None:
+    if preference == "frame":
+        return select_frame_path(moment) or select_crop_path(moment)
+    if preference == "crop":
+        return select_crop_path(moment) or select_frame_path(moment)
+    raise ValueError(f"Unsupported visual preference: {preference}")
+
+
+def select_preview_frame_idx(moment: Moment) -> int:
+    if moment.sample_frames:
+        return int(moment.sample_frames[0])
+    return int(moment.start_frame)
+
+
+def select_preview_second(moment: Moment) -> float:
+    fps = moment.fps if moment.fps > 0 else 30.0
+    return round(select_preview_frame_idx(moment) / fps, 3)
+
+
+def summarize_captions(moment: Moment, limit: int = 2) -> str:
+    if not moment.captions:
+        return f"Tracked object {moment.track_id} in {moment.location} ({moment.split})"
+
+    selected = moment.captions[:limit]
+    summary = " | ".join(selected)
+    if len(moment.captions) > limit:
+        summary = f"{summary} | +{len(moment.captions) - limit} more"
+    return summary
+
+
+def build_frame_info(moment: Moment) -> dict:
+    preview_frame_idx = select_preview_frame_idx(moment)
+    return {
+        "preview_frame_idx": preview_frame_idx,
+        "preview_second": select_preview_second(moment),
+        "start_frame": int(moment.start_frame),
+        "end_frame": int(moment.end_frame),
+        "start_second": round(float(moment.start_second), 3),
+        "end_second": round(float(moment.end_second), 3),
+        "fps": float(moment.fps),
+        "bbox": list(moment.representative_bbox),
+        "sample_frames": [int(frame_idx) for frame_idx in moment.sample_frames],
+        "track_id": moment.track_id,
+        "location": moment.location,
+        "split": moment.split,
+    }
 
 
 def attach_existing_visual_assets(moments: list[Moment], assets_dir: Path) -> list[Moment]:
@@ -129,7 +181,7 @@ def _write_frame(frame, frame_path: Path) -> None:
 
 
 def _frame_size(frame) -> tuple[int, int]:
-    if hasattr(frame, "size"):
+    if hasattr(frame, "size") and not isinstance(frame.size, int):
         width, height = frame.size
         return int(width), int(height)
     height, width = frame.shape[:2]

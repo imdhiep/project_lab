@@ -10,6 +10,7 @@ from .config import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_CLIP_MODEL,
     DEFAULT_CLIP_PRETRAINED,
+    DEFAULT_DATASET_TYPE,
     DEFAULT_FPS,
     DEFAULT_LOCATIONS,
     DEFAULT_MAX_ASSETS_PER_MOMENT,
@@ -23,6 +24,8 @@ from .config import (
     default_visual_root,
 )
 from .dataset import collect_moments, download_from_huggingface
+from .enrichment import apply_enrichment
+from .enrichment_inference import infer_and_write_enrichment
 from .indexer import build_search_bundle, search_index
 from .runtime import RuntimeConfig, rebuild_runtime_bundle, watch_and_rebuild
 from .video_tools import (
@@ -69,23 +72,43 @@ def resolve_profile(profile: str, args: argparse.Namespace) -> tuple[bool, bool,
     return enable_sparse, enable_dense, enable_clip
 
 
+def resolve_dataset_root(args: argparse.Namespace) -> Path:
+    if getattr(args, "dataset_root", None):
+        return Path(args.dataset_root)
+    return default_data_root(args.dataset_type)
+
+
+def resolve_output_dir(args: argparse.Namespace) -> Path:
+    if getattr(args, "output_dir", None):
+        return Path(args.output_dir)
+    return default_bundle_root()
+
+
+def resolve_assets_dir(args: argparse.Namespace) -> Path:
+    if getattr(args, "assets_dir", None):
+        return Path(args.assets_dir)
+    return default_visual_root()
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Full-featured LAVA multimodal search engine")
+    parser = argparse.ArgumentParser(description="Full-featured surveillance multimodal search engine")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     download_parser = subparsers.add_parser("download", help="Download labels, videos and docs from Hugging Face")
+    download_parser.add_argument("--dataset-type", choices=("lava", "personpath22"), default=DEFAULT_DATASET_TYPE)
     download_parser.add_argument("--repo-id", default=DEFAULT_REPO_ID)
-    download_parser.add_argument("--dataset-root", default=str(default_data_root()))
+    download_parser.add_argument("--dataset-root", default=None)
     download_parser.add_argument("--locations", default=None, help="Comma-separated list")
     download_parser.add_argument("--splits", default=None, help="Comma-separated list")
     download_parser.add_argument("--include-videos", action="store_true")
     download_parser.add_argument("--include-docs", action="store_true")
 
     bootstrap_parser = subparsers.add_parser("bootstrap", help="Download selected data and build a production-ready bundle")
+    bootstrap_parser.add_argument("--dataset-type", choices=("lava", "personpath22"), default=DEFAULT_DATASET_TYPE)
     bootstrap_parser.add_argument("--repo-id", default=DEFAULT_REPO_ID)
-    bootstrap_parser.add_argument("--dataset-root", default=str(default_data_root()))
-    bootstrap_parser.add_argument("--output-dir", default=str(default_bundle_root()))
-    bootstrap_parser.add_argument("--assets-dir", default=str(default_visual_root()))
+    bootstrap_parser.add_argument("--dataset-root", default=None)
+    bootstrap_parser.add_argument("--output-dir", default=None)
+    bootstrap_parser.add_argument("--assets-dir", default=None)
     bootstrap_parser.add_argument("--locations", default="amsterdam", help="Comma-separated list")
     bootstrap_parser.add_argument("--splits", default="test", help="Comma-separated list")
     bootstrap_parser.add_argument("--group-mode", choices=("track", "frame"), default="track")
@@ -103,10 +126,12 @@ def build_parser() -> argparse.ArgumentParser:
     bootstrap_parser.add_argument("--no-sparse", action="store_true")
     bootstrap_parser.add_argument("--no-dense", action="store_true")
     bootstrap_parser.add_argument("--no-clip", action="store_true")
+    bootstrap_parser.add_argument("--auto-enrich", action="store_true", help="Infer person attributes and scene evidence from visual assets before building the bundle.")
 
     prepare_parser = subparsers.add_parser("prepare-assets", help="Extract frames and crops for CLIP indexing")
-    prepare_parser.add_argument("--dataset-root", default=str(default_data_root()))
-    prepare_parser.add_argument("--assets-dir", default=str(default_visual_root()))
+    prepare_parser.add_argument("--dataset-type", choices=("lava", "personpath22"), default=DEFAULT_DATASET_TYPE)
+    prepare_parser.add_argument("--dataset-root", default=None)
+    prepare_parser.add_argument("--assets-dir", default=None)
     prepare_parser.add_argument("--locations", default=None, help="Comma-separated list")
     prepare_parser.add_argument("--splits", default=None, help="Comma-separated list")
     prepare_parser.add_argument("--group-mode", choices=("track", "frame"), default="track")
@@ -117,9 +142,10 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--ffmpeg-bin", default="ffmpeg")
 
     build_parser_cmd = subparsers.add_parser("build", help="Build a full multimodal search bundle")
-    build_parser_cmd.add_argument("--dataset-root", default=str(default_data_root()))
-    build_parser_cmd.add_argument("--output-dir", default=str(default_bundle_root()))
-    build_parser_cmd.add_argument("--assets-dir", default=str(default_visual_root()))
+    build_parser_cmd.add_argument("--dataset-type", choices=("lava", "personpath22"), default=DEFAULT_DATASET_TYPE)
+    build_parser_cmd.add_argument("--dataset-root", default=None)
+    build_parser_cmd.add_argument("--output-dir", default=None)
+    build_parser_cmd.add_argument("--assets-dir", default=None)
     build_parser_cmd.add_argument("--locations", default=None, help="Comma-separated list")
     build_parser_cmd.add_argument("--splits", default=None, help="Comma-separated list")
     build_parser_cmd.add_argument("--group-mode", choices=("track", "frame"), default="track")
@@ -137,6 +163,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_parser_cmd.add_argument("--no-sparse", action="store_true")
     build_parser_cmd.add_argument("--no-dense", action="store_true")
     build_parser_cmd.add_argument("--no-clip", action="store_true")
+    build_parser_cmd.add_argument("--auto-enrich", action="store_true", help="Infer person attributes and scene evidence from visual assets before building the bundle.")
 
     search_parser = subparsers.add_parser("search", help="Search by text, image, or both")
     search_parser.add_argument("--output-dir", default=str(default_bundle_root()))
@@ -167,9 +194,10 @@ def build_parser() -> argparse.ArgumentParser:
     api_parser.add_argument("--reload", action="store_true")
 
     rebuild_parser = subparsers.add_parser("rebuild", help="Rebuild the bundle from current dataset files")
-    rebuild_parser.add_argument("--dataset-root", default=str(default_data_root()))
-    rebuild_parser.add_argument("--output-dir", default=str(default_bundle_root()))
-    rebuild_parser.add_argument("--assets-dir", default=str(default_visual_root()))
+    rebuild_parser.add_argument("--dataset-type", choices=("lava", "personpath22"), default=DEFAULT_DATASET_TYPE)
+    rebuild_parser.add_argument("--dataset-root", default=None)
+    rebuild_parser.add_argument("--output-dir", default=None)
+    rebuild_parser.add_argument("--assets-dir", default=None)
     rebuild_parser.add_argument("--locations", default=None, help="Comma-separated list")
     rebuild_parser.add_argument("--splits", default=None, help="Comma-separated list")
     rebuild_parser.add_argument("--group-mode", choices=("track", "frame"), default="track")
@@ -186,11 +214,13 @@ def build_parser() -> argparse.ArgumentParser:
     rebuild_parser.add_argument("--no-sparse", action="store_true")
     rebuild_parser.add_argument("--no-dense", action="store_true")
     rebuild_parser.add_argument("--no-clip", action="store_true")
+    rebuild_parser.add_argument("--auto-enrich", action="store_true", help="Infer person attributes and scene evidence from visual assets before rebuilding the bundle.")
 
     watch_parser = subparsers.add_parser("watch-index", help="Poll the dataset directory and rebuild when files change")
-    watch_parser.add_argument("--dataset-root", default=str(default_data_root()))
-    watch_parser.add_argument("--output-dir", default=str(default_bundle_root()))
-    watch_parser.add_argument("--assets-dir", default=str(default_visual_root()))
+    watch_parser.add_argument("--dataset-type", choices=("lava", "personpath22"), default=DEFAULT_DATASET_TYPE)
+    watch_parser.add_argument("--dataset-root", default=None)
+    watch_parser.add_argument("--output-dir", default=None)
+    watch_parser.add_argument("--assets-dir", default=None)
     watch_parser.add_argument("--locations", default=None, help="Comma-separated list")
     watch_parser.add_argument("--splits", default=None, help="Comma-separated list")
     watch_parser.add_argument("--group-mode", choices=("track", "frame"), default="track")
@@ -209,6 +239,24 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser.add_argument("--no-sparse", action="store_true")
     watch_parser.add_argument("--no-dense", action="store_true")
     watch_parser.add_argument("--no-clip", action="store_true")
+    watch_parser.add_argument("--auto-enrich", action="store_true", help="Infer person attributes and scene evidence during each rebuild cycle.")
+
+    enrich_parser = subparsers.add_parser("enrich", help="Infer person attributes and scene evidence from visual assets")
+    enrich_parser.add_argument("--dataset-type", choices=("lava", "personpath22"), default=DEFAULT_DATASET_TYPE)
+    enrich_parser.add_argument("--dataset-root", default=None)
+    enrich_parser.add_argument("--assets-dir", default=None)
+    enrich_parser.add_argument("--locations", default=None, help="Comma-separated list")
+    enrich_parser.add_argument("--splits", default=None, help="Comma-separated list")
+    enrich_parser.add_argument("--group-mode", choices=("track", "frame"), default="track")
+    enrich_parser.add_argument("--fps", type=float, default=DEFAULT_FPS)
+    enrich_parser.add_argument("--prepare-assets", action="store_true")
+    enrich_parser.add_argument("--max-assets-per-moment", type=int, default=DEFAULT_MAX_ASSETS_PER_MOMENT)
+    enrich_parser.add_argument("--crop-padding", type=float, default=0.08)
+    enrich_parser.add_argument("--clip-model", default=DEFAULT_CLIP_MODEL)
+    enrich_parser.add_argument("--clip-pretrained", default=DEFAULT_CLIP_PRETRAINED)
+    enrich_parser.add_argument("--device", default=None)
+    enrich_parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    enrich_parser.add_argument("--ffmpeg-bin", default="ffmpeg")
 
     demo_parser = subparsers.add_parser("demo", help="Launch Streamlit demo UI")
     demo_parser.add_argument("--port", type=int, default=8501)
@@ -218,7 +266,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _collect_moments_for_args(args: argparse.Namespace):
     return collect_moments(
-        dataset_root=Path(args.dataset_root),
+        dataset_type=args.dataset_type,
+        dataset_root=resolve_dataset_root(args),
         fps=args.fps,
         group_by_track=args.group_mode == "track",
         locations=parse_csv(args.locations),
@@ -229,9 +278,10 @@ def _collect_moments_for_args(args: argparse.Namespace):
 def _runtime_config_from_args(args: argparse.Namespace) -> RuntimeConfig:
     enable_sparse, enable_dense, enable_clip = resolve_profile(args.profile, args)
     return RuntimeConfig(
-        dataset_root=Path(args.dataset_root),
-        output_dir=Path(args.output_dir),
-        assets_dir=Path(args.assets_dir),
+        dataset_type=args.dataset_type,
+        dataset_root=resolve_dataset_root(args),
+        output_dir=resolve_output_dir(args),
+        assets_dir=resolve_assets_dir(args),
         locations=parse_csv(args.locations),
         splits=parse_csv(args.splits),
         group_by_track=args.group_mode == "track",
@@ -247,14 +297,16 @@ def _runtime_config_from_args(args: argparse.Namespace) -> RuntimeConfig:
         max_assets_per_moment=args.max_assets_per_moment,
         crop_padding=args.crop_padding,
         ffmpeg_bin=args.ffmpeg_bin,
+        enable_enrichment=getattr(args, "auto_enrich", False),
     )
 
 
 def command_download(args: argparse.Namespace) -> None:
     locations = parse_csv(args.locations, DEFAULT_LOCATIONS)
     splits = parse_csv(args.splits, DEFAULT_SPLITS)
-    dataset_root = Path(args.dataset_root)
+    dataset_root = resolve_dataset_root(args)
     download_from_huggingface(
+        dataset_type=args.dataset_type,
         dataset_root=dataset_root,
         repo_id=args.repo_id,
         locations=locations,
@@ -266,17 +318,21 @@ def command_download(args: argparse.Namespace) -> None:
 
 
 def command_bootstrap(args: argparse.Namespace) -> None:
-    locations = parse_csv(args.locations, DEFAULT_LOCATIONS)
-    splits = parse_csv(args.splits, DEFAULT_SPLITS)
-    dataset_root = Path(args.dataset_root)
-    download_from_huggingface(
-        dataset_root=dataset_root,
-        repo_id=args.repo_id,
-        locations=locations,
-        splits=splits,
-        include_videos=args.include_videos,
-        include_docs=args.include_docs,
-    )
+    if args.dataset_type == "lava":
+        locations = parse_csv(args.locations, DEFAULT_LOCATIONS)
+        splits = parse_csv(args.splits, DEFAULT_SPLITS)
+        dataset_root = resolve_dataset_root(args)
+        download_from_huggingface(
+            dataset_type=args.dataset_type,
+            dataset_root=dataset_root,
+            repo_id=args.repo_id,
+            locations=locations,
+            splits=splits,
+            include_videos=args.include_videos,
+            include_docs=args.include_docs,
+        )
+    else:
+        print("Skipping download step for PersonPath22. Expecting local annotations and videos under --dataset-root.")
     manifest = rebuild_runtime_bundle(_runtime_config_from_args(args))
     print(
         f"Bootstrap completed. Built {manifest['moment_count']} moments into "
@@ -286,7 +342,7 @@ def command_bootstrap(args: argparse.Namespace) -> None:
 
 def command_prepare_assets(args: argparse.Namespace) -> None:
     moments = _collect_moments_for_args(args)
-    assets_dir = Path(args.assets_dir)
+    assets_dir = resolve_assets_dir(args)
     extract_visual_assets(
         moments,
         output_dir=assets_dir,
@@ -310,11 +366,11 @@ def command_prepare_assets(args: argparse.Namespace) -> None:
 def command_build(args: argparse.Namespace) -> None:
     enable_sparse, enable_dense, enable_clip = resolve_profile(args.profile, args)
     moments = _collect_moments_for_args(args)
-    assets_dir = Path(args.assets_dir)
+    assets_dir = resolve_assets_dir(args)
+    videos_available = any(Path(moment.video_path).exists() for moment in moments)
 
-    if enable_clip:
+    if enable_clip or args.auto_enrich:
         attach_existing_visual_assets(moments, assets_dir)
-        videos_available = any(Path(moment.video_path).exists() for moment in moments)
         missing_visuals = not any(moment.frame_paths or moment.crop_paths for moment in moments)
         if videos_available and (args.prepare_assets or missing_visuals):
             extract_visual_assets(
@@ -327,18 +383,35 @@ def command_build(args: argparse.Namespace) -> None:
             )
             attach_existing_visual_assets(moments, assets_dir)
         visual_summary = count_visual_assets(moments)
-        if visual_summary["moments_with_visuals"] == 0:
-            print(
-                "Warning: CLIP branch disabled because no visual assets were found after asset preparation."
-            )
-        elif args.prepare_assets:
-            raise FileNotFoundError(
-                "CLIP assets requested but videos are missing. Re-run download with --include-videos."
-            )
+        if enable_clip:
+            if visual_summary["moments_with_visuals"] == 0:
+                print(
+                    "Warning: CLIP branch disabled because no visual assets were found after asset preparation."
+                )
+            elif args.prepare_assets and not videos_available:
+                raise FileNotFoundError(
+                    "CLIP assets requested but videos are missing. Re-run download with --include-videos."
+                )
+
+    if args.auto_enrich:
+        attach_existing_visual_assets(moments, assets_dir)
+        summary = infer_and_write_enrichment(
+            moments=moments,
+            dataset_root=resolve_dataset_root(args),
+            clip_model_name=args.clip_model,
+            clip_pretrained=args.clip_pretrained,
+            device=args.device,
+            batch_size=args.batch_size,
+        )
+        moments = apply_enrichment(moments, resolve_dataset_root(args))
+        print(
+            f"Inferred enrichment: {summary['attribute_count']} attribute records and "
+            f"{summary['scene_count']} scene records."
+        )
 
     bundle_path = build_search_bundle(
         moments=moments,
-        output_dir=Path(args.output_dir),
+        output_dir=resolve_output_dir(args),
         enable_sparse=enable_sparse,
         enable_dense=enable_dense,
         enable_clip=enable_clip,
@@ -368,14 +441,15 @@ def command_search(args: argparse.Namespace) -> None:
         return
 
     for rank, item in enumerate(results, start=1):
-        captions = ", ".join(item["captions"]) if item["captions"] else "no caption"
+        frame_info = item.get("frame_info", {})
         print(
             f"[{rank}] score={item['score']:.4f} "
             f"location={item['location']} split={item['split']} "
-            f"frames={item['start_frame']}-{item['end_frame']} "
+            f"preview_frame={frame_info.get('preview_frame_idx', item['start_frame'])} "
             f"seconds={item['start_second']:.2f}-{item['end_second']:.2f} "
-            f"captions={captions} "
-            f"visual={item.get('visual_path')} "
+            f"caption={item.get('caption_text', 'no caption')} "
+            f"frame={item.get('frame_path')} "
+            f"crop={item.get('crop_path')} "
             f"video={item['video_path']}"
         )
 
@@ -424,6 +498,37 @@ def command_rebuild(args: argparse.Namespace) -> None:
     )
 
 
+def command_enrich(args: argparse.Namespace) -> None:
+    moments = _collect_moments_for_args(args)
+    assets_dir = resolve_assets_dir(args)
+    attach_existing_visual_assets(moments, assets_dir)
+    videos_available = any(Path(moment.video_path).exists() for moment in moments)
+    missing_visuals = not any(moment.frame_paths or moment.crop_paths for moment in moments)
+    if videos_available and (args.prepare_assets or missing_visuals):
+        extract_visual_assets(
+            moments,
+            output_dir=assets_dir,
+            max_assets_per_moment=args.max_assets_per_moment,
+            crop_padding=args.crop_padding,
+            overwrite=False,
+            ffmpeg_bin=args.ffmpeg_bin,
+        )
+        attach_existing_visual_assets(moments, assets_dir)
+
+    summary = infer_and_write_enrichment(
+        moments=moments,
+        dataset_root=resolve_dataset_root(args),
+        clip_model_name=args.clip_model,
+        clip_pretrained=args.clip_pretrained,
+        device=args.device,
+        batch_size=args.batch_size,
+    )
+    print(
+        f"Wrote enrichment sidecars to {resolve_dataset_root(args) / 'enrichment'} "
+        f"({summary['attribute_count']} attribute records, {summary['scene_count']} scene records)"
+    )
+
+
 def command_watch_index(args: argparse.Namespace) -> None:
     watch_and_rebuild(
         _runtime_config_from_args(args),
@@ -466,6 +571,8 @@ def main() -> None:
         command_serve_api(args)
     elif args.command == "rebuild":
         command_rebuild(args)
+    elif args.command == "enrich":
+        command_enrich(args)
     elif args.command == "watch-index":
         command_watch_index(args)
     elif args.command == "demo":

@@ -17,5 +17,5 @@ if (-not (Test-Path ".venv\Scripts\python.exe")) {
 $python = Join-Path $root ".venv\Scripts\python.exe"
 
 & $python -m pip install -r requirements.txt
-& $python -m lava_search bootstrap --locations $Location --splits $Split --include-videos --profile strongest
-& $python -m lava_search serve-api --host $Host --port $Port
+& $python -m surveillance_search bootstrap --locations $Location --splits $Split --include-videos --profile strongest
+& $python -m surveillance_search serve-api --host $Host --port $Port

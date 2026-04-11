@@ -34,13 +34,13 @@ class ClipRequest(SearchRequest):
 
 def create_app(output_dir: str | Path) -> FastAPI:
     bundle_dir = Path(output_dir)
-    app = FastAPI(title="LAVA Search API", version="1.0.0")
+    app = FastAPI(title="Surveillance Search API", version="1.0.0")
 
     @app.get("/")
     def root():
         bundle = load_bundle(bundle_dir)
         return {
-            "service": "lava-search",
+            "service": "surveillance-search",
             "bundle_dir": str(bundle_dir),
             "artifacts": bundle.get("artifacts", {}),
         }
