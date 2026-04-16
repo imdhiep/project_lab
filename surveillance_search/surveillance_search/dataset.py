@@ -8,6 +8,7 @@ from typing import Iterable
 
 from .config import DEFAULT_DATASET_TYPE, DEFAULT_FPS
 from .enrichment import apply_enrichment
+from .hospital_ingest import hospital_catalog_path, hospital_metadata_dir, load_hospital_moments
 from .models import Moment
 
 TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -18,7 +19,7 @@ DEFAULT_PERSON_KEYWORDS = ("person", "pedestrian", "human", "surveillance", "tra
 
 def _normalize_dataset_type(dataset_type: str) -> str:
     normalized = str(dataset_type or DEFAULT_DATASET_TYPE).strip().lower()
-    if normalized not in {"lava", "personpath22"}:
+    if normalized not in {"lava", "personpath22", "hospital"}:
         raise ValueError(f"Unsupported dataset type: {dataset_type}")
     return normalized
 
@@ -92,6 +93,14 @@ def iter_label_files(
             yield label_path
         return
 
+    if dataset_type == "hospital":
+        metadata_dir = hospital_metadata_dir(dataset_root)
+        if not metadata_dir.exists():
+            return
+        for metadata_path in sorted(metadata_dir.glob("*.json")):
+            yield metadata_path
+        return
+
     annotation_files = list(_iter_personpath22_annotation_files(dataset_root))
     if annotation_files:
         for annotation_path in annotation_files:
@@ -127,6 +136,20 @@ def iter_dataset_source_files(
             video_path = _video_path_for_label(label_path)
             if video_path.exists():
                 yield video_path
+        return
+
+    if dataset_type == "hospital":
+        metadata_dir = hospital_metadata_dir(dataset_root)
+        if metadata_dir.exists():
+            for metadata_path in sorted(metadata_dir.glob("*.json")):
+                yield metadata_path
+        catalog_path = hospital_catalog_path(dataset_root)
+        if catalog_path.exists():
+            yield catalog_path
+        encoded_dir = dataset_root / "encoded"
+        if encoded_dir.exists():
+            for encoded_path in sorted(encoded_dir.glob("*.h265")):
+                yield encoded_path
         return
 
     yielded: set[Path] = set()
@@ -896,6 +919,12 @@ def collect_moments(
 
     wanted_locations = set(locations or [])
     wanted_splits = set(splits or [])
+    if dataset_type == "hospital":
+        moments = load_hospital_moments(dataset_root)
+        if not moments:
+            return []
+        return [moment for moment in moments if _moment_matches_filters(moment, wanted_locations, wanted_splits)]
+
     moments = []
     for annotation_path in iter_label_files(dataset_root, dataset_type=dataset_type):
         if annotation_path.suffix.lower() == ".json":

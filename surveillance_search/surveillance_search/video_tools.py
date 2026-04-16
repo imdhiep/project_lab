@@ -67,8 +67,10 @@ def build_frame_info(moment: Moment) -> dict:
         "bbox": list(moment.representative_bbox),
         "sample_frames": [int(frame_idx) for frame_idx in moment.sample_frames],
         "track_id": moment.track_id,
+        "camera_id": moment.camera_id or moment.location,
         "location": moment.location,
         "split": moment.split,
+        "content_frames": list(moment.metadata.get("content_frames", [])) if isinstance(moment.metadata, dict) else [],
     }
 
 

@@ -10,20 +10,47 @@ from pathlib import Path
 import streamlit as st
 
 try:
-    from .config import default_bundle_root, project_root
+    from .config import (
+        DEFAULT_BATCH_SIZE,
+        DEFAULT_CLIP_MODEL,
+        DEFAULT_CLIP_PRETRAINED,
+        DEFAULT_SENTENCE_MODEL,
+        default_bundle_root,
+        default_data_root,
+        default_visual_root,
+        project_root,
+    )
+    from .hospital_ingest import HospitalIngestConfig, bootstrap_nvidia_hospital_dataset, ingest_hospital_video
     from .indexer import load_bundle, search_index
     from .qwen_integration import qwen_feature_available
+    from .runtime import RuntimeConfig, rebuild_runtime_bundle
 except ImportError:
     package_root = Path(__file__).resolve().parents[1]
     if str(package_root) not in sys.path:
         sys.path.insert(0, str(package_root))
 
-    from surveillance_search.config import default_bundle_root, project_root
+    from surveillance_search.config import (
+        DEFAULT_BATCH_SIZE,
+        DEFAULT_CLIP_MODEL,
+        DEFAULT_CLIP_PRETRAINED,
+        DEFAULT_SENTENCE_MODEL,
+        default_bundle_root,
+        default_data_root,
+        default_visual_root,
+        project_root,
+    )
+    from surveillance_search.hospital_ingest import (
+        HospitalIngestConfig,
+        bootstrap_nvidia_hospital_dataset,
+        ingest_hospital_video,
+    )
     from surveillance_search.indexer import load_bundle, search_index
     from surveillance_search.qwen_integration import qwen_feature_available
+    from surveillance_search.runtime import RuntimeConfig, rebuild_runtime_bundle
 
 
 DEFAULT_QUERY = "person in red shirt near the road"
+DEFAULT_HOSPITAL_QUEUE_SIZE = 32
 
 
 @st.cache_data(show_spinner=False)
@@ -37,6 +64,247 @@ def _load_bundle_stats(bundle_dir: str) -> dict:
         "with_visual": with_visual,
         "visual_ratio": (with_visual / total) if total else 0.0,
     }
+
+
+def _empty_bundle() -> dict:
+    return {
+        "artifacts": {
+            "sparse": {"enabled": False},
+            "dense": {"enabled": False},
+            "clip": {"enabled": False},
+        }
+    }
+
+
+def _empty_bundle_stats() -> dict:
+    return {
+        "total_moments": 0,
+        "with_visual": 0,
+        "visual_ratio": 0.0,
+    }
+
+
+def _load_bundle_state(bundle_dir: str) -> tuple[dict, dict, bool, str | None]:
+    try:
+        bundle = load_bundle(Path(bundle_dir))
+        bundle_stats = _load_bundle_stats(bundle_dir)
+        return bundle, bundle_stats, True, None
+    except Exception as exc:
+        return _empty_bundle(), _empty_bundle_stats(), False, str(exc)
+
+
+def _default_nvidia_hospital_root() -> Path:
+    return (
+        project_root().parents[1]
+        / "Multi-Camera-Person-Tracking-and-Re-Identification"
+        / "data"
+        / "NVIDIA_SmartSpaces"
+        / "MTMC_Tracking_2025"
+        / "val"
+        / "Hospital_000"
+    )
+
+
+def _hospital_runtime_config(bundle_dir: str | Path) -> RuntimeConfig:
+    return RuntimeConfig(
+        dataset_type="hospital",
+        dataset_root=default_data_root("hospital"),
+        output_dir=Path(bundle_dir),
+        assets_dir=default_visual_root(),
+        locations=None,
+        splits=None,
+        group_by_track=True,
+        fps=30.0,
+        enable_sparse=True,
+        enable_dense=True,
+        enable_clip=True,
+        sentence_model_name=DEFAULT_SENTENCE_MODEL,
+        clip_model_name=DEFAULT_CLIP_MODEL,
+        clip_pretrained=DEFAULT_CLIP_PRETRAINED,
+        device=None,
+        batch_size=DEFAULT_BATCH_SIZE,
+        max_assets_per_moment=8,
+        crop_padding=0.08,
+        ffmpeg_bin="ffmpeg",
+        enable_enrichment=False,
+    )
+
+
+def _hospital_ingest_config() -> HospitalIngestConfig:
+    return HospitalIngestConfig(
+        dataset_root=default_data_root("hospital"),
+        assets_dir=default_visual_root(),
+        ffmpeg_bin="ffmpeg",
+        preferred_encoder="hevc_nvenc",
+        queue_size=DEFAULT_HOSPITAL_QUEUE_SIZE,
+        enable_enrichment=True,
+        clip_model_name=DEFAULT_CLIP_MODEL,
+        clip_pretrained=DEFAULT_CLIP_PRETRAINED,
+        batch_size=DEFAULT_BATCH_SIZE,
+        max_assets_per_moment=8,
+        crop_padding=0.08,
+        timeline_stride_seconds=1.0,
+        max_timeline_segments=16,
+    )
+
+
+def _store_pipeline_notice(kind: str, message: str, payload: dict | None = None) -> None:
+    st.session_state["pipeline_notice"] = {
+        "kind": kind,
+        "message": message,
+        "payload": payload or {},
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _render_pipeline_notice() -> None:
+    notice = st.session_state.get("pipeline_notice")
+    if not notice:
+        return
+    kind = notice.get("kind", "info")
+    message = str(notice.get("message", "")).strip()
+    payload = notice.get("payload") or {}
+    if kind == "success":
+        st.success(message)
+    elif kind == "error":
+        st.error(message)
+    else:
+        st.info(message)
+    if payload:
+        with st.expander("Latest pipeline result", expanded=False):
+            st.json(payload)
+
+
+def _refresh_after_pipeline(bundle_dir: str, notice_kind: str, message: str, payload: dict | None = None) -> None:
+    _load_bundle_stats.clear()
+    st.session_state["bundle_dir"] = bundle_dir
+    st.session_state["search_results"] = None
+    st.session_state["last_updated"] = datetime.now(timezone.utc)
+    _store_pipeline_notice(notice_kind, message, payload)
+    st.rerun()
+
+
+def _run_hospital_rebuild(bundle_dir: str) -> None:
+    with st.spinner("Đang dựng lại metadata chi tiết cho 31 video NVIDIA Hospital..."):
+        summary = bootstrap_nvidia_hospital_dataset(
+            nvidia_root=_default_nvidia_hospital_root(),
+            config=_hospital_ingest_config(),
+            recorded_start="2026-01-01T00:00:00Z",
+            limit=31,
+        )
+        manifest = rebuild_runtime_bundle(_hospital_runtime_config(bundle_dir))
+    _refresh_after_pipeline(
+        bundle_dir,
+        "success",
+        f"Đã rebuild {summary['processed_videos']} video NVIDIA Hospital và cập nhật bundle với {manifest['moment_count']} person-tracks.",
+        {"bootstrap": summary, "manifest": manifest},
+    )
+
+
+def _save_uploaded_video(uploaded_file) -> Path:
+    upload_dir = project_root() / ".streamlit-cache" / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    suffix = Path(uploaded_file.name).suffix or ".mp4"
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    target_path = upload_dir / f"{timestamp}_{Path(uploaded_file.name).stem}{suffix}"
+    with target_path.open("wb") as handle:
+        handle.write(uploaded_file.getbuffer())
+    return target_path
+
+
+def _run_hospital_add_video(bundle_dir: str, uploaded_video, camera_id: str, start_time: str) -> None:
+    source_path = _save_uploaded_video(uploaded_video)
+    with st.spinner("Đang ingest video mới, convert H.265, sinh metadata theo từng người, rồi rebuild bundle..."):
+        ingest_summary = ingest_hospital_video(
+            source_path=source_path,
+            config=_hospital_ingest_config(),
+            camera_id=camera_id.strip() or None,
+            recorded_start=start_time.strip() or None,
+        )
+        manifest = rebuild_runtime_bundle(_hospital_runtime_config(bundle_dir))
+    _refresh_after_pipeline(
+        bundle_dir,
+        "success",
+        f"Đã add video mới `{ingest_summary['video_id']}` và cập nhật bundle với {manifest['moment_count']} person-tracks.",
+        {"ingest": ingest_summary, "manifest": manifest},
+    )
+
+
+def _render_hospital_pipeline_panel(bundle_dir: str) -> None:
+    st.markdown(
+        """
+        <div class="panel panel-strong" style="margin: 0.6rem 0 1rem;">
+            <div class="section-title">Hospital pipeline controls</div>
+            <p class="section-copy">
+                Rebuild toàn bộ metadata cho 31 video NVIDIA Hospital, hoặc add đúng 1 video mới để pipeline chỉ xử lý video đó,
+                convert sang H.265, sinh person metadata chi tiết, rồi cập nhật bundle query.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    _render_pipeline_notice()
+
+    rebuild_col, add_col = st.columns(2, gap="large")
+    with rebuild_col:
+        st.markdown(
+            """
+            <div class="panel">
+                <div class="section-title">Rebuild 31 video nền</div>
+                <p class="section-copy">
+                    Dùng lại 31 camera NVIDIA Hospital có sẵn, convert sang H.265, sinh metadata per-person chi tiết, rồi rebuild bundle.
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("Run 31-video rebuild", type="primary", width="stretch"):
+            try:
+                _run_hospital_rebuild(bundle_dir)
+            except Exception as exc:
+                _store_pipeline_notice("error", f"Không thể rebuild 31 video: {exc}")
+                st.rerun()
+
+    with add_col:
+        st.markdown(
+            """
+            <div class="panel">
+                <div class="section-title">Add video mới</div>
+                <p class="section-copy">
+                    Chỉ ingest đúng video mới, tự convert sang H.265, detect người, sinh metadata chi tiết theo track, rồi cập nhật bundle.
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        with st.form("hospital_add_video_form", clear_on_submit=True):
+            uploaded_video = st.file_uploader(
+                "Video mới",
+                type=["mp4", "mov", "avi", "mkv", "h265", "hevc"],
+                help="Có thể upload video gốc; pipeline sẽ tự convert sang H.265 để lưu trong queue.",
+            )
+            camera_id = st.text_input(
+                "Camera ID",
+                value="",
+                help="Để trống nếu muốn dùng tên file làm camera ID.",
+            )
+            start_time = st.text_input(
+                "Recorded start UTC",
+                value="",
+                placeholder="2026-01-01T00:10:00Z",
+                help="Không bắt buộc. Nếu để trống, hệ thống sẽ dùng thời gian file hiện có.",
+            )
+            submit_add = st.form_submit_button("Add new video", type="primary", width="stretch")
+
+        if submit_add:
+            if uploaded_video is None:
+                st.warning("Chọn một video trước khi bấm add.")
+            else:
+                try:
+                    _run_hospital_add_video(bundle_dir, uploaded_video, camera_id, start_time)
+                except Exception as exc:
+                    _store_pipeline_notice("error", f"Không thể add video mới: {exc}")
+                    st.rerun()
 
 
 def _inject_styles() -> None:
@@ -311,7 +579,7 @@ def _render_header(bundle: dict) -> None:
     )
 
 
-def _render_sidebar(bundle_dir: str, bundle: dict, bundle_stats: dict) -> tuple[str, int, str, bool, bool]:
+def _render_sidebar(bundle_dir: str, bundle: dict, bundle_stats: dict, bundle_ready: bool) -> tuple[str, int, str, bool, bool]:
     with st.sidebar:
         st.markdown("### Search Controls")
         st.caption("Keep the sidebar for setup and filters so the main canvas can focus on evidence.")
@@ -326,7 +594,10 @@ def _render_sidebar(bundle_dir: str, bundle: dict, bundle_stats: dict) -> tuple[
 
         with st.expander("Bundle status", expanded=True):
             artifacts = bundle.get("artifacts", {})
-            st.success("Bundle loaded and query-ready.")
+            if bundle_ready:
+                st.success("Bundle loaded and query-ready.")
+            else:
+                st.warning("Bundle chưa sẵn sàng. Bạn có thể rebuild 31 video hoặc add video mới ở panel chính.")
             status_cols = st.columns(3)
             status_cols[0].metric("Sparse", "On" if artifacts.get("sparse", {}).get("enabled") else "Off")
             status_cols[1].metric("Dense", "On" if artifacts.get("dense", {}).get("enabled") else "Off")
@@ -459,17 +730,20 @@ def _render_search_form(bundle: dict) -> tuple[str, str | None, bool]:
     return query_text, image_path, run
 
 
-def _render_empty_state() -> None:
+def _render_empty_state(
+    title: str = "Search results will appear here.",
+    message: str = (
+        "Start with a short query such as “person crossing the street” or “white van near the curb”. "
+        "The app will surface one hero result first, then show ranking detail and diagnostics only if you want to inspect them."
+    ),
+) -> None:
     st.markdown(
         """
         <div class="empty-state">
-            <div class="empty-title">Search results will appear here.</div>
-            <p class="empty-copy">
-                Start with a short query such as “person crossing the street” or “white van near the curb”.
-                The app will surface one hero result first, then show ranking detail and diagnostics only if you want to inspect them.
-            </p>
+            <div class="empty-title">{title}</div>
+            <p class="empty-copy">{message}</p>
         </div>
-        """,
+        """.format(title=html.escape(title), message=html.escape(message)),
         unsafe_allow_html=True,
     )
 
@@ -814,38 +1088,40 @@ def main() -> None:
     st.set_page_config(page_title="Surveillance Search", layout="wide")
     _inject_styles()
 
+    st.session_state.setdefault("bundle_dir", str(default_bundle_root()))
     st.session_state.setdefault("search_results", None)
     st.session_state.setdefault("query_text", DEFAULT_QUERY)
     st.session_state.setdefault("search_mode", "person")
     st.session_state.setdefault("last_updated", None)
 
-    initial_bundle_dir = str(default_bundle_root())
+    bundle_dir = st.session_state["bundle_dir"]
+    bundle, bundle_stats, bundle_ready, bundle_error = _load_bundle_state(bundle_dir)
 
-    try:
-        bundle = load_bundle(Path(initial_bundle_dir))
-    except Exception as exc:
-        st.markdown(
-            f"""
-            <div class="empty-state">
-                <div class="empty-title">Bundle is not ready yet.</div>
-                <p class="empty-copy">{html.escape(str(exc))}</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        return
-    bundle_stats = _load_bundle_stats(initial_bundle_dir)
+    sidebar_bundle_dir, top_k, search_mode, use_qwen_parser, use_qwen_reranker = _render_sidebar(
+        bundle_dir,
+        bundle,
+        bundle_stats,
+        bundle_ready,
+    )
+    if sidebar_bundle_dir != bundle_dir:
+        bundle_dir = sidebar_bundle_dir
+        st.session_state["bundle_dir"] = bundle_dir
+        bundle, bundle_stats, bundle_ready, bundle_error = _load_bundle_state(bundle_dir)
 
     _render_header(bundle)
-    bundle_dir, top_k, search_mode, use_qwen_parser, use_qwen_reranker = _render_sidebar(initial_bundle_dir, bundle, bundle_stats)
+    _render_hospital_pipeline_panel(bundle_dir)
 
-    if bundle_dir != initial_bundle_dir:
-        try:
-            bundle = load_bundle(Path(bundle_dir))
-            bundle_stats = _load_bundle_stats(bundle_dir)
-        except Exception as exc:
-            st.error(str(exc))
-            return
+    if not bundle_ready:
+        if bundle_error:
+            st.info(f"Bundle hiện chưa load được từ `{bundle_dir}`: {bundle_error}")
+        _render_empty_state(
+            title="Bundle chưa sẵn sàng để query.",
+            message=(
+                "Bấm `Run 31-video rebuild` để dựng sẵn dữ liệu cho 31 video NVIDIA Hospital, "
+                "hoặc upload 1 video mới ở panel trên để ingest incremental rồi build bundle."
+            ),
+        )
+        return
 
     query_text, image_path, run = _render_search_form(bundle)
 
@@ -865,6 +1141,8 @@ def main() -> None:
                 )
             except Exception as exc:
                 st.error(str(exc))
+            else:
+                bundle, bundle_stats, bundle_ready, bundle_error = _load_bundle_state(bundle_dir)
 
     results = st.session_state.get("search_results")
     if not results:

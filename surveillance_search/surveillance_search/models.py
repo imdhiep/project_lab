@@ -40,6 +40,8 @@ class Moment:
     crop_paths: list[str] = field(default_factory=list)
     attribute_evidence: dict = field(default_factory=dict)
     scene_evidence: dict = field(default_factory=dict)
+    camera_id: str = ""
+    metadata: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -53,4 +55,6 @@ class Moment:
         payload.setdefault("crop_paths", [])
         payload.setdefault("attribute_evidence", {})
         payload.setdefault("scene_evidence", {})
+        payload.setdefault("camera_id", "")
+        payload.setdefault("metadata", {})
         return cls(**payload)

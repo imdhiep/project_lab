@@ -2,6 +2,7 @@ from pathlib import Path
 
 DEFAULT_REPO_ID = "xiaoyu123hhh/Lava_Dataset"
 DEFAULT_DATASET_TYPE = "lava"
+SUPPORTED_DATASET_TYPES = ("lava", "personpath22", "hospital")
 DEFAULT_LOCATIONS = (
     "amsterdam",
     "caldot1",
@@ -48,6 +49,8 @@ def _legacy_personpath22_root() -> Path:
 
 def default_data_root(dataset_type: str = DEFAULT_DATASET_TYPE) -> Path:
     data_root = project_root() / "data"
+    if dataset_type == "hospital":
+        return data_root / "hospital"
     if dataset_type == "personpath22":
         preferred_root = data_root / "personpath22"
         legacy_external_root = _legacy_personpath22_root()

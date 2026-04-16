@@ -467,7 +467,10 @@ def build_search_bundle(
         )
 
     if enable_clip:
-        visual_paths = [select_visual_path(moment, preference="frame") for moment in moments]
+        visual_paths = [
+            select_visual_path(moment, preference="crop" if _person_signal(moment) > 0.0 else "frame")
+            for moment in moments
+        ]
         valid_items = [(index, path) for index, path in enumerate(visual_paths) if path]
         if not valid_items:
             bundle["artifacts"]["clip"] = {

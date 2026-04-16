@@ -19,6 +19,7 @@ from .config import (
     DEFAULT_SENTENCE_MODEL,
     DEFAULT_SPLITS,
     DEFAULT_TOP_K,
+    SUPPORTED_DATASET_TYPES,
     default_bundle_root,
     default_data_root,
     default_visual_root,
@@ -26,6 +27,12 @@ from .config import (
 from .dataset import collect_moments, download_from_huggingface
 from .enrichment import apply_enrichment
 from .enrichment_inference import infer_and_write_enrichment
+from .hospital_ingest import (
+    HospitalIngestConfig,
+    DEFAULT_QUEUE_SIZE,
+    bootstrap_nvidia_hospital_dataset,
+    ingest_hospital_video,
+)
 from .indexer import build_search_bundle, search_index
 from .qwen_integration import local_qwen_embedding_model
 from .runtime import RuntimeConfig, rebuild_runtime_bundle, watch_and_rebuild
@@ -107,7 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     download_parser = subparsers.add_parser("download", help="Download labels, videos and docs from Hugging Face")
-    download_parser.add_argument("--dataset-type", choices=("lava", "personpath22"), default=DEFAULT_DATASET_TYPE)
+    download_parser.add_argument("--dataset-type", choices=SUPPORTED_DATASET_TYPES, default=DEFAULT_DATASET_TYPE)
     download_parser.add_argument("--repo-id", default=DEFAULT_REPO_ID)
     download_parser.add_argument("--dataset-root", default=None)
     download_parser.add_argument("--locations", default=None, help="Comma-separated list")
@@ -116,7 +123,7 @@ def build_parser() -> argparse.ArgumentParser:
     download_parser.add_argument("--include-docs", action="store_true")
 
     bootstrap_parser = subparsers.add_parser("bootstrap", help="Download selected data and build a production-ready bundle")
-    bootstrap_parser.add_argument("--dataset-type", choices=("lava", "personpath22"), default=DEFAULT_DATASET_TYPE)
+    bootstrap_parser.add_argument("--dataset-type", choices=SUPPORTED_DATASET_TYPES, default=DEFAULT_DATASET_TYPE)
     bootstrap_parser.add_argument("--repo-id", default=DEFAULT_REPO_ID)
     bootstrap_parser.add_argument("--dataset-root", default=None)
     bootstrap_parser.add_argument("--output-dir", default=None)
@@ -142,7 +149,7 @@ def build_parser() -> argparse.ArgumentParser:
     bootstrap_parser.add_argument("--auto-enrich", action="store_true", help="Infer person attributes and scene evidence from visual assets before building the bundle.")
 
     prepare_parser = subparsers.add_parser("prepare-assets", help="Extract frames and crops for CLIP indexing")
-    prepare_parser.add_argument("--dataset-type", choices=("lava", "personpath22"), default=DEFAULT_DATASET_TYPE)
+    prepare_parser.add_argument("--dataset-type", choices=SUPPORTED_DATASET_TYPES, default=DEFAULT_DATASET_TYPE)
     prepare_parser.add_argument("--dataset-root", default=None)
     prepare_parser.add_argument("--assets-dir", default=None)
     prepare_parser.add_argument("--locations", default=None, help="Comma-separated list")
@@ -155,7 +162,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--ffmpeg-bin", default="ffmpeg")
 
     build_parser_cmd = subparsers.add_parser("build", help="Build a full multimodal search bundle")
-    build_parser_cmd.add_argument("--dataset-type", choices=("lava", "personpath22"), default=DEFAULT_DATASET_TYPE)
+    build_parser_cmd.add_argument("--dataset-type", choices=SUPPORTED_DATASET_TYPES, default=DEFAULT_DATASET_TYPE)
     build_parser_cmd.add_argument("--dataset-root", default=None)
     build_parser_cmd.add_argument("--output-dir", default=None)
     build_parser_cmd.add_argument("--assets-dir", default=None)
@@ -216,7 +223,7 @@ def build_parser() -> argparse.ArgumentParser:
     api_parser.add_argument("--reload", action="store_true")
 
     rebuild_parser = subparsers.add_parser("rebuild", help="Rebuild the bundle from current dataset files")
-    rebuild_parser.add_argument("--dataset-type", choices=("lava", "personpath22"), default=DEFAULT_DATASET_TYPE)
+    rebuild_parser.add_argument("--dataset-type", choices=SUPPORTED_DATASET_TYPES, default=DEFAULT_DATASET_TYPE)
     rebuild_parser.add_argument("--dataset-root", default=None)
     rebuild_parser.add_argument("--output-dir", default=None)
     rebuild_parser.add_argument("--assets-dir", default=None)
@@ -240,7 +247,7 @@ def build_parser() -> argparse.ArgumentParser:
     rebuild_parser.add_argument("--auto-enrich", action="store_true", help="Infer person attributes and scene evidence from visual assets before rebuilding the bundle.")
 
     watch_parser = subparsers.add_parser("watch-index", help="Poll the dataset directory and rebuild when files change")
-    watch_parser.add_argument("--dataset-type", choices=("lava", "personpath22"), default=DEFAULT_DATASET_TYPE)
+    watch_parser.add_argument("--dataset-type", choices=SUPPORTED_DATASET_TYPES, default=DEFAULT_DATASET_TYPE)
     watch_parser.add_argument("--dataset-root", default=None)
     watch_parser.add_argument("--output-dir", default=None)
     watch_parser.add_argument("--assets-dir", default=None)
@@ -266,7 +273,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser.add_argument("--auto-enrich", action="store_true", help="Infer person attributes and scene evidence during each rebuild cycle.")
 
     enrich_parser = subparsers.add_parser("enrich", help="Infer person attributes and scene evidence from visual assets")
-    enrich_parser.add_argument("--dataset-type", choices=("lava", "personpath22"), default=DEFAULT_DATASET_TYPE)
+    enrich_parser.add_argument("--dataset-type", choices=SUPPORTED_DATASET_TYPES, default=DEFAULT_DATASET_TYPE)
     enrich_parser.add_argument("--dataset-root", default=None)
     enrich_parser.add_argument("--assets-dir", default=None)
     enrich_parser.add_argument("--locations", default=None, help="Comma-separated list")
@@ -284,6 +291,71 @@ def build_parser() -> argparse.ArgumentParser:
 
     demo_parser = subparsers.add_parser("demo", help="Launch Streamlit demo UI")
     demo_parser.add_argument("--port", type=int, default=8501)
+
+    ingest_parser = subparsers.add_parser("ingest-video", help="Ingest a new hospital camera video incrementally")
+    ingest_parser.add_argument("--source-path", required=True)
+    ingest_parser.add_argument("--dataset-type", choices=("hospital",), default="hospital")
+    ingest_parser.add_argument("--dataset-root", default=None)
+    ingest_parser.add_argument("--output-dir", default=None)
+    ingest_parser.add_argument("--assets-dir", default=None)
+    ingest_parser.add_argument("--camera-id", default=None)
+    ingest_parser.add_argument("--start-time", default=None, help="Recorded UTC start time in ISO 8601.")
+    ingest_parser.add_argument("--queue-size", type=int, default=DEFAULT_QUEUE_SIZE)
+    ingest_parser.add_argument("--detection-fps", type=float, default=1.0)
+    ingest_parser.add_argument("--min-track-frames", type=int, default=2)
+    ingest_parser.add_argument("--min-person-area", type=int, default=1600)
+    ingest_parser.add_argument("--profile", choices=("strongest", "balanced", "text-only", "lite"), default=DEFAULT_PROFILE)
+    ingest_parser.add_argument("--sentence-model", default=DEFAULT_SENTENCE_MODEL)
+    ingest_parser.add_argument("--use-qwen-embedding", action="store_true", help="Use the local ./models/Qwen3-Embedding-4B directory as the dense embedding model.")
+    ingest_parser.add_argument("--clip-model", default=DEFAULT_CLIP_MODEL)
+    ingest_parser.add_argument("--clip-pretrained", default=DEFAULT_CLIP_PRETRAINED)
+    ingest_parser.add_argument("--device", default=None)
+    ingest_parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    ingest_parser.add_argument("--max-assets-per-moment", type=int, default=DEFAULT_MAX_ASSETS_PER_MOMENT)
+    ingest_parser.add_argument("--crop-padding", type=float, default=0.08)
+    ingest_parser.add_argument("--ffmpeg-bin", default="ffmpeg")
+    ingest_parser.add_argument("--encoder", default="hevc_nvenc")
+    ingest_parser.add_argument("--no-enrichment", action="store_true")
+    ingest_parser.add_argument("--no-sparse", action="store_true")
+    ingest_parser.add_argument("--no-dense", action="store_true")
+    ingest_parser.add_argument("--no-clip", action="store_true")
+
+    bootstrap_nvidia_parser = subparsers.add_parser(
+        "bootstrap-nvidia-hospital",
+        help="Precompute the NVIDIA Hospital camera set into detailed per-person metadata",
+    )
+    bootstrap_nvidia_parser.add_argument("--dataset-type", choices=("hospital",), default="hospital")
+    bootstrap_nvidia_parser.add_argument("--dataset-root", default=None)
+    bootstrap_nvidia_parser.add_argument("--output-dir", default=None)
+    bootstrap_nvidia_parser.add_argument("--assets-dir", default=None)
+    bootstrap_nvidia_parser.add_argument(
+        "--nvidia-root",
+        default="/teamspace/studios/this_studio/Multi-Camera-Person-Tracking-and-Re-Identification/data/NVIDIA_SmartSpaces/MTMC_Tracking_2025/val/Hospital_000",
+    )
+    bootstrap_nvidia_parser.add_argument("--start-time", default=None, help="Recorded UTC base start time in ISO 8601.")
+    bootstrap_nvidia_parser.add_argument("--limit", type=int, default=31)
+    bootstrap_nvidia_parser.add_argument("--queue-size", type=int, default=DEFAULT_QUEUE_SIZE)
+    bootstrap_nvidia_parser.add_argument("--group-mode", choices=("track", "frame"), default="track")
+    bootstrap_nvidia_parser.add_argument("--fps", type=float, default=DEFAULT_FPS)
+    bootstrap_nvidia_parser.add_argument("--locations", default=None)
+    bootstrap_nvidia_parser.add_argument("--splits", default=None)
+    bootstrap_nvidia_parser.add_argument("--profile", choices=("strongest", "balanced", "text-only", "lite"), default=DEFAULT_PROFILE)
+    bootstrap_nvidia_parser.add_argument("--sentence-model", default=DEFAULT_SENTENCE_MODEL)
+    bootstrap_nvidia_parser.add_argument("--use-qwen-embedding", action="store_true", help="Use the local ./models/Qwen3-Embedding-4B directory as the dense embedding model.")
+    bootstrap_nvidia_parser.add_argument("--clip-model", default=DEFAULT_CLIP_MODEL)
+    bootstrap_nvidia_parser.add_argument("--clip-pretrained", default=DEFAULT_CLIP_PRETRAINED)
+    bootstrap_nvidia_parser.add_argument("--device", default=None)
+    bootstrap_nvidia_parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    bootstrap_nvidia_parser.add_argument("--max-assets-per-moment", type=int, default=8)
+    bootstrap_nvidia_parser.add_argument("--crop-padding", type=float, default=0.08)
+    bootstrap_nvidia_parser.add_argument("--timeline-stride-seconds", type=float, default=1.0)
+    bootstrap_nvidia_parser.add_argument("--max-timeline-segments", type=int, default=16)
+    bootstrap_nvidia_parser.add_argument("--ffmpeg-bin", default="ffmpeg")
+    bootstrap_nvidia_parser.add_argument("--encoder", default="hevc_nvenc")
+    bootstrap_nvidia_parser.add_argument("--no-enrichment", action="store_true")
+    bootstrap_nvidia_parser.add_argument("--no-sparse", action="store_true")
+    bootstrap_nvidia_parser.add_argument("--no-dense", action="store_true")
+    bootstrap_nvidia_parser.add_argument("--no-clip", action="store_true")
 
     return parser
 
@@ -325,6 +397,28 @@ def _runtime_config_from_args(args: argparse.Namespace) -> RuntimeConfig:
     )
 
 
+def _hospital_ingest_config_from_args(args: argparse.Namespace) -> HospitalIngestConfig:
+    return HospitalIngestConfig(
+        dataset_root=resolve_dataset_root(args),
+        assets_dir=resolve_assets_dir(args),
+        ffmpeg_bin=getattr(args, "ffmpeg_bin", "ffmpeg"),
+        preferred_encoder=getattr(args, "encoder", "hevc_nvenc"),
+        queue_size=getattr(args, "queue_size", DEFAULT_QUEUE_SIZE),
+        detection_fps=getattr(args, "detection_fps", 1.0),
+        min_track_frames=getattr(args, "min_track_frames", 2),
+        min_person_area=getattr(args, "min_person_area", 1600),
+        enable_enrichment=not getattr(args, "no_enrichment", False),
+        clip_model_name=getattr(args, "clip_model", DEFAULT_CLIP_MODEL),
+        clip_pretrained=getattr(args, "clip_pretrained", DEFAULT_CLIP_PRETRAINED),
+        device=getattr(args, "device", None),
+        batch_size=getattr(args, "batch_size", DEFAULT_BATCH_SIZE),
+        max_assets_per_moment=getattr(args, "max_assets_per_moment", DEFAULT_MAX_ASSETS_PER_MOMENT),
+        crop_padding=getattr(args, "crop_padding", 0.08),
+        timeline_stride_seconds=getattr(args, "timeline_stride_seconds", 1.0),
+        max_timeline_segments=getattr(args, "max_timeline_segments", 16),
+    )
+
+
 def command_download(args: argparse.Namespace) -> None:
     locations = parse_csv(args.locations, DEFAULT_LOCATIONS)
     splits = parse_csv(args.splits, DEFAULT_SPLITS)
@@ -355,8 +449,10 @@ def command_bootstrap(args: argparse.Namespace) -> None:
             include_videos=args.include_videos,
             include_docs=args.include_docs,
         )
-    else:
+    elif args.dataset_type == "personpath22":
         print("Skipping download step for PersonPath22. Expecting local annotations and videos under --dataset-root.")
+    else:
+        print("Skipping download step for hospital video mode. Expecting incremental ingest via `ingest-video`.")
     manifest = rebuild_runtime_bundle(_runtime_config_from_args(args))
     print(
         f"Bootstrap completed. Built {manifest['moment_count']} moments into "
@@ -575,6 +671,38 @@ def command_watch_index(args: argparse.Namespace) -> None:
     )
 
 
+def command_ingest_video(args: argparse.Namespace) -> None:
+    ingest_summary = ingest_hospital_video(
+        source_path=Path(args.source_path),
+        config=_hospital_ingest_config_from_args(args),
+        camera_id=args.camera_id,
+        recorded_start=args.start_time,
+    )
+    manifest = rebuild_runtime_bundle(_runtime_config_from_args(args))
+    print(
+        f"Ingested {ingest_summary['video_id']} with {ingest_summary['person_count']} person tracks. "
+        f"Bundle now contains {manifest['moment_count']} moments at {manifest['output_dir']}."
+    )
+    if ingest_summary["evicted_video_ids"]:
+        print(f"Evicted oldest videos: {', '.join(ingest_summary['evicted_video_ids'])}")
+    print(f"Encoded video: {ingest_summary['encoded_path']}")
+    print(f"Metadata: {ingest_summary['metadata_path']}")
+
+
+def command_bootstrap_nvidia_hospital(args: argparse.Namespace) -> None:
+    summary = bootstrap_nvidia_hospital_dataset(
+        nvidia_root=Path(args.nvidia_root),
+        config=_hospital_ingest_config_from_args(args),
+        recorded_start=args.start_time,
+        limit=args.limit,
+    )
+    manifest = rebuild_runtime_bundle(_runtime_config_from_args(args))
+    print(
+        f"Prepared {summary['processed_videos']} NVIDIA hospital videos with detailed person metadata. "
+        f"Bundle now contains {manifest['moment_count']} moments at {manifest['output_dir']}."
+    )
+
+
 def command_demo(args: argparse.Namespace) -> None:
     app_path = Path(__file__).with_name("streamlit_app.py")
     command = [
@@ -613,6 +741,10 @@ def main() -> None:
         command_enrich(args)
     elif args.command == "watch-index":
         command_watch_index(args)
+    elif args.command == "ingest-video":
+        command_ingest_video(args)
+    elif args.command == "bootstrap-nvidia-hospital":
+        command_bootstrap_nvidia_hospital(args)
     elif args.command == "demo":
         command_demo(args)
     else:
